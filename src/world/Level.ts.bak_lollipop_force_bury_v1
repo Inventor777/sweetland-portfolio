@@ -1,0 +1,2990 @@
+import * as THREE from "three";
+import type { Physics } from "../physics/Physics";
+import { ASSETS } from "../config/assets";
+import { PORTFOLIO_SECTIONS } from "../config/portfolio";
+import { loadGLTF } from "../core/gltf";
+import { coinMesh } from "./primitives";
+// SWEETLAND_PARTIAL_FIX_V1
+// Fix for runtime ReferenceError: partial is not defined (a previous patch referenced `partial(...)`).
+const partial = (fn, ...preset) => (...later) => fn(...preset, ...later);
+
+// SWEETLAND_NUDGE_DOWN_HELPER_V1
+// Simple one-time adjustment for props where visible mesh doesn't match collider surface.
+function __sweetlandNudgeNodesDown(root, nameRe, deltaY) {
+  try {
+    root.traverse((o) => {
+      const nm = (o && o.name) ? String(o.name) : "";
+      if (!nm) return;
+      if (!nameRe.test(nm)) return;
+      o.position.y -= deltaY;
+    });
+  } catch (e) {
+    // no-op
+  }
+}
+
+import { clamp } from "../core/clamp"; // SWEETLAND_LOLLIPOP_SINK_V3
+
+type PlatformCandidate = {
+  obj: THREE.Mesh;
+  name: string;
+  bbox: THREE.Box3;
+  size: THREE.Vector3;
+  center: THREE.Vector3;
+  topY: number;
+  area: number;
+};
+
+export class Level {
+  scene = new THREE.Group();
+
+  // Static colliders live on one fixed rigid-body
+  private staticBody!: any;
+
+  // Gameplay collections
+  portals = new Map<string, { group: THREE.Group; sensor: any; teleportTo: THREE.Vector3 }>();
+  coins = new Map<string, { mesh: THREE.Mesh; sensor: any; baseY: number }>();
+  // Baked-in pickups inside Sweet_Land.glb (Coin_01.*, Gem_*, Box_*, etc.)
+  bakedPickups = new Map<
+    string,
+    {
+      mesh: THREE.Object3D;
+      kind: string;
+      basePos: THREE.Vector3;
+      centerLocal: THREE.Vector3;
+      baseY: number;
+      baseRotY: number;
+      maxDim: number;
+      collected: boolean;
+
+      // InstancedMesh support (optional)
+      instanced?: boolean;
+      instanceId?: number;
+      baseMatrix?: THREE.Matrix4;
+    }
+  >();
+
+  // Ladders detected from the world GLB (for Minecraft-style climbing)
+  ladders: { bbox: THREE.Box3; center: THREE.Vector3; minY: number; maxY: number }[] = [];
+
+  getLadderAt(pos: THREE.Vector3): { center: THREE.Vector3; minY: number; maxY: number } | null {
+    let best: { center: THREE.Vector3; minY: number; maxY: number } | null = null;
+    let bestD2 = Infinity;
+
+    for (const l of this.ladders) {
+      if (pos.y < l.minY - 0.6 || pos.y > l.maxY + 0.9) continue;
+      if (pos.x < l.bbox.min.x - 0.8 || pos.x > l.bbox.max.x + 0.8) continue;
+      if (pos.z < l.bbox.min.z - 0.8 || pos.z > l.bbox.max.z + 0.8) continue;
+
+      const dx = l.center.x - pos.x;
+      const dz = l.center.z - pos.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < bestD2) {
+        bestD2 = d2;
+        best = { center: l.center, minY: l.minY, maxY: l.maxY };
+      }
+    }
+
+    return best;
+  }
+
+
+  npcs = new Map<
+  string,
+  {
+    group: THREE.Group;
+    body: any;   // Rapier rigid body (fixed)
+    solid: any;  // Rapier collider (capsule)
+    sensor: any; // Rapier collider (ball sensor)
+    name: string;
+    baseY: number;
+    mixer?: THREE.AnimationMixer;
+    clips?: THREE.AnimationClip[];
+    actions?: {
+      idle?: THREE.AnimationAction;
+      talk?: THREE.AnimationAction;
+      walk?: THREE.AnimationAction;
+      run?: THREE.AnimationAction;
+      jump?: THREE.AnimationAction;
+      fall?: THREE.AnimationAction;
+    };
+    current?: THREE.AnimationAction | null;
+  }
+>();
+
+  private coinSpawn: { id: string; pos: THREE.Vector3 }[] = [];
+
+  // Computed from the GLB world
+  private _spawn = new THREE.Vector3(0, 3, 0);
+  private _portalSpots = new Map<string, THREE.Vector3>();
+
+  // Keep a handle to the loaded world scene for raycasts / placement.
+  private worldRoot?: THREE.Object3D;
+
+  constructor(private physics: Physics) {}
+
+  get spawn(): THREE.Vector3 {
+    return this._spawn.clone();
+  }
+
+  get portalSpots(): Map<string, THREE.Vector3> {
+    return this._portalSpots;
+  }
+
+
+  // Hardcoded portal placements (permanent)
+  // (Captured via Shift+P after positioning: projects/work/collabs/contact)
+  private static readonly HARD_PORTALS: Record<string, { x: number; y: number; z: number; rotY: number }> = {
+    // Exact values printed by Shift+P
+    projects: { x: -37.248, y: 5.98, z: 57.762, rotY: -1.5708 },
+    work:     { x: -23.955, y: 12.166, z: -47.355, rotY: 3.1416 },
+    collabs:  { x: 26.076,  y: 11.72,  z: -52.997, rotY: 20.4204 },
+    contact:  { x: -38.896, y: 8.0,    z: 16.069,  rotY: 9.4248 },
+  };
+
+  private hardPortal(id: string): { pos: THREE.Vector3; rotY: number } | null {
+    const p = (Level.HARD_PORTALS as any)[id];
+    if (!p) return null;
+    return { pos: new THREE.Vector3(p.x, p.y, p.z), rotY: Number(p.rotY) || 0 };
+  }
+
+
+  // Adds an extra waffle/cookie slab near the "work" portal area so you can chain the jump
+  // from the tower platform -> (new slab) -> existing floating slab -> the jello platform.
+    private addTowerJumpHelperSlab(root: THREE.Object3D): void {
+
+// Optional: let you lock in the slab position in-game (Shift+J) without hardcoding coords.
+const getLS = (key: string) => {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const w: any = typeof window !== "undefined" ? window : null;
+    return w?.localStorage?.getItem?.(key) ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const parseJSON = <T,>(raw: string | null): T | null => {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+};
+
+// If you saved a custom position (Shift+J), use it.
+const slabOverride = parseJSON<{ x: number; y?: number; z: number; rotY?: number }>(
+  getLS("sweetland:slab02")
+);
+
+// Default anchor near the "work" portal, but you can override by saving slabOverride.
+const work = this.hardPortal("work");
+const anchor = work?.pos?.clone?.() ?? new THREE.Vector3(0, 0, 0);
+
+
+// If you saved a position (Shift+J), place slab02 exactly there on load.
+// We intentionally do NOT rely on the saved Y (player height can be misleading);
+// instead we snap to the top surface Y of the nearest existing waffle slab.
+if (slabOverride) {
+  const targetAnchor = new THREE.Vector3(slabOverride.x, anchor.y, slabOverride.z);
+
+  // Find the closest existing waffle slab to copy (ignore vertical band filtering).
+  const snap =
+    this.findNearestWaffleSlab(root, targetAnchor, -Infinity, true) ??
+    this.findNearestWaffleSlab(root, anchor, -Infinity, true);
+
+  if (!snap) {
+    // eslint-disable-next-line no-console
+    console.warn(`[SweetLand] Could not find any waffle slab to clone for slab02 override.`);
+    return;
+  }
+
+  // Remove any existing instance (safety)
+  const existing = root.getObjectByName("jump_bridge_slab02");
+  if (existing && existing.parent) existing.parent.remove(existing);
+
+  const snapBox = new THREE.Box3().setFromObject(snap);
+  const size = new THREE.Vector3();
+  snapBox.getSize(size);
+
+  const topY = snapBox.max.y;
+  const centerY = topY - size.y * 0.5;
+
+  const slab = snap.clone(true) as THREE.Mesh;
+  slab.name = "jump_bridge_slab02";
+  slab.position.set(slabOverride.x, centerY, slabOverride.z);
+  slab.rotation.set(0, slabOverride.rotY ?? slab.rotation.y, 0);
+  slab.updateMatrixWorld(true);
+
+  // Physics collider (use the exact mesh bounds)
+  this.addSolidAABB({
+    name: "jump_bridge_slab02",
+    center: { x: slabOverride.x, y: centerY, z: slabOverride.z },
+    size: { x: size.x, y: size.y, z: size.z },
+  });
+
+  root.add(slab);
+
+  // eslint-disable-next-line no-console
+  console.log(`[SweetLand] Placed slab02 from saved override.`, slabOverride, { snappedToTopY: topY });
+
+  return;
+}
+
+const platforms = this.findPlatformCandidates(root, anchor);
+if (!platforms.length) return;
+
+// Pick a "big" platform near the anchor (helps avoid tiny NPC bases).
+const byDist = platforms
+  .map((p) => ({
+    p,
+    d: new THREE.Vector2(p.center.x - anchor.x, p.center.z - anchor.z).length(),
+  }))
+  .sort((a, b) => a.d - b.d);
+
+const near = byDist.filter((x) => x.d < 25);
+const towerPlatform =
+  (near.length
+    ? near
+        .slice(0, 12)
+        .sort((a, b) => b.p.area - a.p.area || a.d - b.d)[0]?.p
+    : byDist.slice(0, 12).sort((a, b) => b.p.area - a.p.area || a.d - b.d)[0]?.p) ?? byDist[0].p;
+
+// Find the waffle slab nearest the chosen platform.
+const nearestWaffle =
+  this.findNearestWaffleSlab(root, towerPlatform.center) ?? this.findNearestWaffleSlab(root, anchor);
+if (!nearestWaffle) return;
+
+// Clone the actual waffle slab mesh so it looks identical.
+const slab = nearestWaffle.mesh.clone() as THREE.Mesh;
+slab.name = "JumpBridge_Slab02";
+
+// Ensure we get a unique geometry/material instance (prevents accidental shared-state edits).
+try {
+  // @ts-ignore
+  slab.geometry = nearestWaffle.mesh.geometry?.clone?.() ?? slab.geometry;
+  // @ts-ignore
+  const mat = nearestWaffle.mesh.material;
+  // @ts-ignore
+  slab.material = Array.isArray(mat) ? mat.map((m: any) => (m?.clone ? m.clone() : m)) : mat?.clone?.() ?? mat;
+} catch {
+  // ignore
+}
+
+// Determine placement
+const slabCenterY = nearestWaffle.topY - nearestWaffle.size.y * 0.5;
+
+if (slabOverride) {
+  // Place exactly where user saved (XZ), but snap height/rotation to the nearest waffle slab.
+  const wNear = this.findNearestWaffleSlab(root, anchor) ?? nearestWaffle;
+  const y = wNear.topY - wNear.size.y * 0.5;
+  slab.position.set(slabOverride.x, y, slabOverride.z);
+  slab.rotation.set(0, slabOverride.rotY ?? wNear.rotY ?? 0, 0);
+} else {
+  // Auto-place between the nearest waffle slab and the big nearby platform.
+  const dir = new THREE.Vector3(
+    towerPlatform.center.x - nearestWaffle.center.x,
+    0,
+    towerPlatform.center.z - nearestWaffle.center.z
+  );
+  const dist = dir.length();
+  if (dist < 0.25) return;
+  dir.multiplyScalar(1 / dist);
+
+  // Project each AABB half-extent along the direction to estimate "edges".
+  const waffleProj =
+    Math.abs(dir.x) * (nearestWaffle.size.x * 0.5) + Math.abs(dir.z) * (nearestWaffle.size.z * 0.5);
+  const platProj = Math.abs(dir.x) * (towerPlatform.size.x * 0.5) + Math.abs(dir.z) * (towerPlatform.size.z * 0.5);
+
+  const fromEdge = nearestWaffle.center.clone().add(dir.clone().multiplyScalar(waffleProj + 0.05));
+  const toEdge = towerPlatform.center.clone().add(dir.clone().multiplyScalar(-(platProj + 0.05)));
+
+  const mid = fromEdge.clone().lerp(toEdge, 0.5);
+  slab.position.set(mid.x, slabCenterY, mid.z);
+  slab.rotation.set(0, nearestWaffle.rotY ?? 0, 0);
+}
+
+slab.updateMatrixWorld(true);
+
+// Collider for the slab
+this.addBoxCollider(slab, {
+  name: "jump_bridge_slab02",
+  friction: 0.9,
+  restitution: 0.0,
+  // Slight shrink to prevent snagging at edges
+  shrink: 0.98,
+});
+
+root.add(slab);
+  }
+
+
+private findNearestWaffleSlab(
+    world: THREE.Object3D,
+    anchor: THREE.Vector3,
+    minY: number = -Infinity,
+    ignoreYBand: boolean = false,
+  ): THREE.Mesh | null {
+    const box = new THREE.Box3();
+    const size = new THREE.Vector3();
+    // SWEETLAND_LOLLIPOP_SINK_V8
+    // How deep to bury the big lollipop stick into the ground (increase to sink deeper).
+    const SWEETLAND_LOLLIPOP_BURY = 3.0; // meters-ish
+
+    const center = new THREE.Vector3();
+
+    let best: THREE.Mesh | null = null;
+    let bestD = Infinity;
+
+    world.traverse((o) => {
+      const mesh = o as any as THREE.Mesh;
+      if (!mesh || !(mesh as any).isMesh) return;
+
+      const name = ((mesh.name || "") as string).toLowerCase();
+      // Strong name hints first
+      const nameHit = name.includes("waffle") || name.includes("cookie") || name.includes("biscuit") || name.includes("platform_waffle");
+
+      // Bounding box tests (thin + not huge)
+      box.setFromObject(mesh);
+      box.getSize(size);
+      box.getCenter(center);
+
+        if (center.y < minY) return;
+
+      // Must be in roughly the same vertical band as the anchor (upper area)
+      if (!ignoreYBand) {
+        if (center.y < anchor.y - 6 || center.y > anchor.y + 8) return;
+      }
+
+      // Must be "slab-like": thin and medium-sized
+      const maxXZ = Math.max(size.x, size.z);
+      const minXZ = Math.min(size.x, size.z);
+      const thin = size.y <= 1.0;
+      const medium = maxXZ <= 10.0 && minXZ >= 1.5;
+
+      if (!thin || !medium) return;
+
+      // Distance gate: near the work-portal region only
+      const dx = center.x - anchor.x;
+      const dz = center.z - anchor.z;
+      const d = Math.sqrt(dx * dx + dz * dz);
+      if (d < 3.0 || d > 35.0) return;
+
+      // If no name hint, require a squarish/rect slab footprint
+      if (!nameHit) {
+        if (maxXZ < 2.0) return;
+        // Avoid very long bridges/ramps
+        if (maxXZ / Math.max(0.0001, minXZ) > 2.5) return;
+      }
+
+      if (d < bestD) {
+        bestD = d;
+        best = mesh;
+      }
+    });
+
+    return best;
+  }
+
+  async build(onProgress?: (p01: number) => void): Promise<void> {
+    this.scene.name = "SweetLand";
+
+    // Base rigidbody for all colliders
+    this.staticBody = this.physics.world.createRigidBody(this.physics.R.RigidBodyDesc.fixed());
+
+    // Safety catch plane far below (prevents falling forever if something goes wrong)
+    {
+      const desc = this.physics.R.ColliderDesc.cuboid(500, 1, 500)
+        .setTranslation(0, -60, 0)
+        .setFriction(1.0);
+      this.physics.world.createCollider(desc, this.staticBody);
+    }
+
+    if (!ASSETS.world) {
+      throw new Error("Missing ASSETS.world path (src/config/assets.ts).");
+    }
+
+    onProgress?.(0.02);
+
+    // Load world GLB
+    const gltf = await loadGLTF(ASSETS.world, {
+      onProgress: (loaded, total) => {
+        if (total > 0) onProgress?.(0.02 + 0.40 * (loaded / total));
+      }
+    });
+
+    const world = gltf.scene;
+    this.worldRoot = world;
+    world.name = "SweetLandWorld";
+    world.traverse((o) => {
+      // Reduce snaggy visuals: still keep shadows for the big pieces
+      if ((o as THREE.Mesh).isMesh) {
+        const m = o as THREE.Mesh;
+        m.castShadow = true;
+        m.receiveShadow = true;
+        // Improve PBR look a bit without changing your materials too much
+        const mat = m.material as any;
+        if (mat && typeof mat.roughness === "number") mat.roughness = Math.min(0.95, Math.max(0.25, mat.roughness));
+      }
+    });
+
+    this.scene.add(world);
+
+    this.addJelloGapBridge2Slabs(world);
+    onProgress?.(0.45);
+
+    // Add an extra slab to make the tower jump chainable
+    // this.addTowerJumpHelperSlab(world); // disabled: replaced by addJumpBridgeSlab()
+    // Colliders from world meshes (walkables = trimesh, props = boxes).
+    // Water surfaces must stay visual-only so the player can wade/submerge.
+    this.ladders = [];
+    const { walkables, props, waters } = this.collectMeshGroups(world);
+
+    // Robust water-surface detection (covers cases where water was misclassified as walkable/prop).
+    const isWaterSurface = (mesh: THREE.Mesh): boolean => {
+        const name = (mesh.name || "").toLowerCase();
+      const mat: any = (mesh as any).material;
+      let matNames = "";
+      if (Array.isArray(mat)) matNames = mat.map((mm) => mm?.name || "").join(" ").toLowerCase();
+      else matNames = (mat?.name || "").toLowerCase();
+
+      const lower = `${name} ${matNames}`;
+      // NOTE: do NOT match "icecream"/"scoop" pickups — keep to water-ish words only.
+      const WATERLIKE = /(water|river|lake|sea|ocean|pond|stream|canal|puddle|pool|frozenwater|icewater)/i;
+      if (!WATERLIKE.test(lower)) return false;
+
+      // Water surfaces in this world are large + very thin.
+      const box = new THREE.Box3().setFromObject(mesh);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const area = size.x * size.z;
+      return size.y <= 0.18 && area >= 8.0;
+    };
+
+    // Water: visual-only (no solid colliders). The riverbed/terrain below remains walkable.
+    for (const w of waters) w.userData.isWaterSurface = true;
+
+    // Fix a common Sweet Land pack issue: some tall decorative props (trees, lollipops, etc.)
+    // can be authored with an origin/pivot that leaves them hovering above the terrain.
+    // Drop a conservative subset of "ground-anchored" decorations onto the nearest walkable surface.
+    const groundTargets = walkables.filter((m) => !isWaterSurface(m));
+    this.dropFloatingDecorations(props, groundTargets);
+
+// Hard-fix two known floating decorations by authored GLB names.
+// Use a broader ground mesh list (walkables + props) but exclude the decoration itself.
+const groundTargetsAll = walkables.filter((m) => !isWaterSurface(m)); // SWEETLAND_GROUND_FIX_V14
+this.forceGroundNamedDecorations(["Lollipop_", "TreeChocolate_01012"], groundTargetsAll);
+
+// Walkables: trimesh (accurate platforms/bridges)
+    for (const m of walkables) {
+      if (isWaterSurface(m)) continue;
+      this.addTrimeshCollider(m, { friction: 1.0 });
+    }
+
+    // Props: box colliders (fast + less snag)
+    // Important: exclude truly giant backdrop meshes so we don't accidentally block navigation.
+    for (const m of props) {
+      const n = (m.name || "").toLowerCase();
+      if (n.includes("backdrop") || n.includes("background") || n.includes("sky")) continue;
+      if (isWaterSurface(m)) continue;
+
+      // Measure once
+      const box = new THREE.Box3().setFromObject(m);
+      const size = new THREE.Vector3();
+      box.getSize(size);
+      const vol = size.x * size.y * size.z;
+      const maxDim = Math.max(size.x, size.y, size.z);
+
+      // Skip only truly giant backdrop/skybox meshes; keep big walls/buildings so the player can't walk through them.
+      if ((vol > 25000 || maxDim > 250) && (n.includes("backdrop") || n.includes("background") || n.includes("sky") || n.includes("cloud") || n.includes("mountain") || n.includes("hill") || n.includes("terrain") || n.includes("landscape") || n.includes("distant"))) {
+        continue;
+      }
+
+      
+      // Candy-cane gates / arches:
+      // - Candy canes should be solid.
+      // - The blue "screen"/plasma should be pass-through.
+      // Some gate assets use generic child mesh names (e.g. "Plane"), so use the full name chain (mesh + parents + materials).
+      const deepLower = this.fullLower(m);
+      const candyGateish =
+        deepLower.includes("cane") ||
+        deepLower.includes("candycane") ||
+        deepLower.includes("candy-cane") ||
+        deepLower.includes("gate") ||
+        deepLower.includes("arch") ||
+        deepLower.includes("portal");
+
+      const looksTransparent = this.isTransparentMaterial((m as any).material);
+      // Gate screens are often flat panels with generic names (e.g. "Plane") and sometimes opaque materials.
+      // Detect them by shape under gate/arch/cane/portal groups so they remain pass-through.
+      const __dimsGate = [size.x, size.y, size.z].sort((a, b) => a - b);
+      const __aGate = __dimsGate[0];
+      const __bGate = __dimsGate[1];
+      const __cGate = __dimsGate[2];
+      const __denGate = Math.max(__aGate, 1e-6);
+      const __thinGatePanel =
+        __aGate <= 0.22 &&
+        __bGate / __denGate >= 2.4 &&
+        __cGate / __denGate >= 6.0 &&
+        __bGate >= 0.8 &&
+        __cGate >= 1.6;
+
+      const isGateScreen =
+        deepLower.includes("doorplasma") ||
+        deepLower.includes("door_01") ||
+        deepLower.includes("door01") ||
+        (candyGateish &&
+          (deepLower.includes("plasma") ||
+            deepLower.includes("screen") ||
+            deepLower.includes("forcefield") ||
+            deepLower.includes("shield") ||
+            deepLower.includes("energy") ||
+            deepLower.includes("glass") ||
+            deepLower.includes("window") ||
+            looksTransparent ||
+            __thinGatePanel));
+
+      if (isGateScreen) {
+        continue;
+      }
+
+      // For the gate frame itself, add *frame* colliders (posts) so the opening remains walkable.
+      // (We intentionally do NOT add a single solid collider for the whole gate mesh.)
+      if (candyGateish && (deepLower.includes("gate") || deepLower.includes("arch") || deepLower.includes("cane"))) {
+        this.addGateFrameColliders(m);
+        continue;
+      }
+
+const mn = (((m.material as any)?.name ?? "") as string).toLowerCase();
+      // Avoid adding tiny decorative glass/plasma shards as colliders (they can snag the player),
+      // but do NOT skip large structural panels/walls (like the teal wall + rainbow panel area).
+      const isLikelyWallPanel = n.includes("wall") || n.includes("panel") || n.includes("rainbow") || n.includes("teal");
+      const looksLikeSmallPanel =
+        !isLikelyWallPanel &&
+        (n.includes("glass") || n.includes("plasma") || mn.includes("glass") || mn.includes("plasma")) &&
+        maxDim < 1.9 &&
+        vol < 10;
+      if (looksLikeSmallPanel) continue;
+
+      // Reduce seam-gaps on large structural pieces (prevents slipping into walls)
+      const shrink = (maxDim > 12 || size.y > 6 || size.x * size.z > 40) ? 0.99 : 0.92;
+
+      // Instanced meshes need per-instance colliders (otherwise Rapier gets one big incorrect box).
+      if ((m as any).isInstancedMesh) {
+        this.addInstancedBoxColliders(m as any, { friction: 0.9, shrink, maxInstances: 320 });
+        continue;
+      }
+
+      this.addBoxCollider(m, { friction: 0.9, shrink });
+    }
+
+    onProgress?.(0.72);
+
+    // Analyze platforms to find hub + 4 nearby portal platforms
+    const platformCandidates = this.findPlatformCandidates(world);
+    const hub = this.pickHubPlatform(platformCandidates);
+    this._spawn = hub.center.clone();
+    this._spawn.y = hub.topY + 1.4;
+
+    const portalPlatforms = this.pickPortalPlatforms(platformCandidates, hub);
+
+    // Place portals (Gate_01 if available, otherwise a primitive fallback label)
+    await this.createPortals(portalPlatforms, onProgress);
+    this.addJumpBridgeSlab(world);
+
+    onProgress?.(0.86);
+
+    // Coins + NPCs (placed relative to hub/portals)
+    this.seedCoins(hub, portalPlatforms);
+    await this.addNPCs(hub, platformCandidates, onProgress);
+
+    onProgress?.(1.0);
+  }
+
+  update(t: number): void {
+    // coin idle motion
+    for (const c of this.coins.values()) {
+      c.mesh.rotation.y = t * 2.2;
+      c.mesh.position.y = c.baseY + Math.sin(t * 3.5) * 0.12;
+    }
+    
+    // baked pickup idle motion
+    for (const p of this.bakedPickups.values()) {
+      if (p.collected) continue;
+
+      const obj: any = p.mesh as any;
+
+      // InstancedMesh pickups (if any) are handled per-instance and we do not animate them here.
+      if (p.instanced && obj?.isInstancedMesh && typeof p.instanceId === "number") continue;
+
+      if (!p.mesh.visible) continue;
+
+      p.mesh.rotation.y = p.baseRotY + t * 1.6;
+      p.mesh.position.y = p.baseY + Math.sin(t * 2.6 + p.basePos.x * 0.25) * 0.08;
+    }
+// npc idle
+    for (const n of this.npcs.values()) {
+      n.group.position.y = n.baseY + Math.sin(t * 2.0 + n.group.position.x * 0.2) * 0.03;
+      n.mixer?.update(1 / 60);
+    }
+  }
+
+  // --- Coins
+  respawnCoins(): void {
+    for (const [id, c] of this.coins) {
+      this.scene.remove(c.mesh);
+      this.physics.untagCollider(c.sensor);
+      this.physics.world.removeCollider(c.sensor, true);
+      this.coins.delete(id);
+    }
+    for (const s of this.coinSpawn) this.createCoin(s.id, s.pos);
+    this.respawnBakedPickups();
+  }
+
+  collectCoin(id: string): void {
+    const c = this.coins.get(id);
+    if (!c) return;
+    this.scene.remove(c.mesh);
+    this.physics.untagCollider(c.sensor);
+    this.physics.world.removeCollider(c.sensor, true);
+    this.coins.delete(id);
+  }
+
+    // --- Baked pickups (from Sweet_Land.glb)
+  collectBakedPickup(id: string): void {
+    const p = this.bakedPickups.get(id);
+    if (!p || p.collected) return;
+    p.collected = true;
+
+    const obj: any = p.mesh as any;
+
+    // InstancedMesh: hide just this instance by scaling it to ~0
+    if (p.instanced && obj?.isInstancedMesh && typeof p.instanceId === "number") {
+      const inst = obj as THREE.InstancedMesh;
+      const m4 = new THREE.Matrix4();
+      inst.getMatrixAt(p.instanceId, m4);
+
+      // Save base matrix once so respawn can restore it
+      if (!p.baseMatrix) p.baseMatrix = m4.clone();
+
+      const pos = new THREE.Vector3();
+      const quat = new THREE.Quaternion();
+      const scl = new THREE.Vector3();
+      m4.decompose(pos, quat, scl);
+      scl.setScalar(0.0001);
+      m4.compose(pos, quat, scl);
+
+      inst.setMatrixAt(p.instanceId, m4);
+      (inst.instanceMatrix as any).needsUpdate = true;
+      return;
+    }
+
+    // Regular Mesh/Group
+    p.mesh.visible = false;
+  }
+
+  respawnBakedPickups(): void {
+    for (const p of this.bakedPickups.values()) {
+      p.collected = false;
+
+      const obj: any = p.mesh as any;
+
+      // InstancedMesh: restore original instance matrix
+      if (p.instanced && obj?.isInstancedMesh && typeof p.instanceId === "number") {
+        const inst = obj as THREE.InstancedMesh;
+        if (p.baseMatrix) {
+          inst.setMatrixAt(p.instanceId, p.baseMatrix);
+          (inst.instanceMatrix as any).needsUpdate = true;
+        }
+        continue;
+      }
+
+      // Regular Mesh/Group
+      p.mesh.visible = true;
+      p.mesh.position.copy(p.basePos);
+      p.mesh.rotation.y = p.baseRotY;
+    }
+  }
+
+// --- NPC talk animation
+  playNpcTalk(id: string): void {
+    const npc = this.npcs.get(id);
+    if (!npc?.actions) return;
+    const talk = npc.actions.talk;
+    const idle = npc.actions.idle;
+    if (!talk) return;
+    talk.reset();
+    talk.setLoop(THREE.LoopOnce, 1);
+    talk.clampWhenFinished = true;
+    talk.fadeIn(0.12).play();
+    if (npc.current && npc.current !== talk) npc.current.fadeOut(0.12);
+    npc.current = talk;
+
+    // Return to idle after
+    const dur = talk.getClip().duration;
+    window.setTimeout(() => {
+      if (!idle) return;
+      idle.reset().fadeIn(0.15).play();
+      talk.fadeOut(0.15);
+      npc.current = idle;
+    }, Math.max(200, (dur * 1000) | 0));
+  }
+
+  // --- Helpers
+
+private collectMeshGroups(
+  root: THREE.Object3D
+): { walkables: THREE.Mesh[]; props: THREE.Mesh[]; waters: THREE.Mesh[] } {
+  const walkables: THREE.Mesh[] = [];
+  const props: THREE.Mesh[] = [];
+  const waters: THREE.Mesh[] = [];
+
+  const WATER_RE = /(water|river|lake|sea|ocean)/i;
+
+  // Names in this asset pack are inconsistent — treat the obvious ground/ramp pieces as walkable.
+  const WALK_RE = /(platform|ground|bridge|stair|stairs|ramp|angle|path|road|floor|terrain|land|trampoline|slope|slide)/i;
+
+  // Things we never want to classify as pickups.
+  const STRUCTURAL_RE =
+    /(wall|roof|house|building|tower|castle|gate|arch|cane|door|fence|rail|post|pillar|tree|bush|foliage|leaf|branch|mountain|hill|cloud|sky|backdrop|background|landscape|npc|character|lamp|sign)/i;
+
+  // Explicit pickup words (covers the “uncollectible” props: question block, ring, dice, present, ice cream scoop, lightning bolt).
+  const PICKUP_RE =
+    /(coin|gem|crystal|diamond|jewel|dice|\bdie\b|ring|hoop|torus|present|gift|prize|reward|mystery|question|qmark|surprise|box|crate|chest|energy|lightning|bolt|zap|thunder|icecream|ice\s*cream|scoop|cone|cupcake|muffin|twist|swirl|twirl)/i;
+
+  const getFullLower = (obj: THREE.Object3D): string => {
+    const parts: string[] = [];
+    let cur: THREE.Object3D | null = obj;
+    while (cur) {
+      if (cur.name) parts.push(cur.name);
+      cur = cur.parent;
+    }
+
+    // Material names help a lot in this pack
+    const mat = (obj as any).material;
+    if (Array.isArray(mat)) {
+      for (const mm of mat) if (mm?.name) parts.push(mm.name);
+    } else if (mat?.name) {
+      parts.push(mat.name);
+    }
+
+    return parts.join(" ").toLowerCase();
+  };
+
+const getSelfLower = (obj: THREE.Object3D): string => {
+  const parts: string[] = [];
+  if (obj.name) parts.push(obj.name);
+
+  const mat = (obj as any).material;
+  if (Array.isArray(mat)) {
+    for (const mm of mat) if (mm?.name) parts.push(mm.name);
+  } else if (mat?.name) {
+    parts.push(mat.name);
+  }
+
+  return parts.join(" ").toLowerCase();
+};
+
+  root.updateMatrixWorld(true);
+
+  root.traverse((o) => {
+    const anyObj: any = o as any;
+    if (!anyObj?.isMesh) return;
+
+    const m = o as THREE.Mesh;
+    const geom = m.geometry as THREE.BufferGeometry;
+    if (!geom?.attributes?.position) return;
+
+    // Skip invisible
+    if ((m.material as any)?.visible === false) return;
+
+    const lower = getFullLower(m);
+    const selfLower = getSelfLower(m);
+
+    // Water
+    if (WATER_RE.test(lower)) {
+      waters.push(m);
+      return;
+    }
+
+    // Measure (world)
+    const box = new THREE.Box3().setFromObject(m);
+    const size = new THREE.Vector3();
+    const centerW = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(centerW);
+
+    const vol = size.x * size.y * size.z;
+    if (!isFinite(vol) || vol < 0.002) return;
+
+    const area = size.x * size.z;
+    const maxDim = Math.max(size.x, size.y, size.z);
+
+    // Ladders: register climb volumes (still treated as props)
+    const isLadder = /(ladder|climb|rope|rung)/i.test(lower);
+    if (isLadder && size.y > 0.8 && size.y < 18 && maxDim < 10) {
+      const cc = new THREE.Vector3();
+      box.getCenter(cc);
+      this.ladders.push({ bbox: box.clone(), center: cc, minY: box.min.y, maxY: box.max.y });
+    }
+
+
+    // Gate / portal "screen" panels must never become walkables (or they get trimesh colliders and block the player).
+    // Some of these meshes have generic names/materials, so we also use a thin-panel shape heuristic.
+    if (lower.indexOf("doorplasma") !== -1 || lower.indexOf("door_01") !== -1 || lower.indexOf("door01") !== -1) {
+      props.push(m);
+      return;
+    }
+    const __gateish =
+      lower.indexOf("cane") !== -1 ||
+      lower.indexOf("candycane") !== -1 ||
+      lower.indexOf("candy-cane") !== -1 ||
+      lower.indexOf("gate") !== -1 ||
+      lower.indexOf("arch") !== -1 ||
+      lower.indexOf("portal") !== -1;
+    if (__gateish) {
+      const __dims = [size.x, size.y, size.z].sort((a, b) => a - b);
+      const __a = __dims[0];
+      const __b = __dims[1];
+      const __c = __dims[2];
+      const __den = Math.max(__a, 1e-6);
+      const __thinPanel =
+        __a <= 0.22 &&
+        __b / __den >= 2.4 &&
+        __c / __den >= 6.0 &&
+        __b >= 0.8 &&
+        __c >= 1.6;
+      const __looksTransparent = this.isTransparentMaterial((m as any).material);
+      const __screenish =
+        lower.indexOf("plasma") !== -1 ||
+        lower.indexOf("screen") !== -1 ||
+        lower.indexOf("forcefield") !== -1 ||
+        lower.indexOf("shield") !== -1 ||
+        lower.indexOf("energy") !== -1 ||
+        lower.indexOf("glass") !== -1 ||
+        lower.indexOf("window") !== -1 ||
+        __looksTransparent ||
+        __thinPanel;
+      if (__screenish) {
+        props.push(m);
+        return;
+      }
+    }
+
+    // Walkables BEFORE pickups so ramps never get misclassified again.
+// BUT: never classify pickups (especially baked coins / props under bridges) as walkables,
+// or they become solid/non-collectible.
+const keywordPickupEarly = PICKUP_RE.test(selfLower);
+const coinLike = /coin/i.test(selfLower);
+
+
+// If the environment GLB contains decorative "coin rings" around portal gates,
+// remove them here so only the procedurally spawned coins remain.
+// (This targets pickup-like coin/ring meshes that are nested under portal/gate groups.)
+const portalish = /(portal|gate|arch|cane)/i.test(lower);
+const portalCoinRing = keywordPickupEarly && portalish && /(coin|ring|hoop|torus)/i.test(selfLower);
+if (portalCoinRing) {
+  try { m.visible = false; } catch {}
+  try { (m as any).userData = { ...(m as any).userData, __sweetlandRemovedPortalCoinRing: true }; } catch {}
+  return;
+}
+
+// Use full path for walkable tags so bridge/stair meshes nested under groups still count,
+// but never let small pickup-like meshes become walkables.
+const smallPropLike = maxDim <= 1.8 && vol <= 10 && area <= 4;
+const walkableByName = WALK_RE.test(lower) && !keywordPickupEarly && !smallPropLike;
+
+const notWalkableLike = STRUCTURAL_RE.test(selfLower);
+    const maxXZ = Math.max(size.x, size.z);
+    const minXZ = Math.min(size.x, size.z);
+    const aspect = minXZ > 1e-6 ? maxXZ / minXZ : 999;
+
+    // Heuristic: broad-ish surfaces with modest thickness are walkable (ramps/platform slabs).
+    const looksLikeRampOrPlatform =
+      !walkableByName &&
+      !notWalkableLike &&
+      !keywordPickupEarly &&
+      size.y > 0.12 &&
+      size.y < 1.6 &&
+      area > 6.0 &&
+      (aspect > 1.25 || area > 18);
+
+    if (walkableByName || looksLikeRampOrPlatform) {
+      walkables.push(m);
+      return;
+    }
+
+    // Baked pickups
+    // Hard safety: never treat very large meshes as pickups.
+    // Some baked coins are larger "floor coins" (area > 22) — still treat them as pickups.
+    const smallEnough =
+      maxDim >= 0.05 &&
+      maxDim <= 6.0 &&
+      vol <= 260 &&
+      (area <= 22 || (coinLike && area <= 80));
+
+    // Don't ever treat gates/arches/doors/fences as pickups.
+    const excludedByStructure = STRUCTURAL_RE.test(selfLower) || isLadder;
+
+    const keywordPickup = PICKUP_RE.test(selfLower);
+
+    // Fallback pickup heuristic: tiny decorative props become collectible (helps when names are missing).
+    const fallbackPickup = !excludedByStructure && maxDim <= 2.4 && vol <= 18 && area <= 8;
+
+    if ((keywordPickup || fallbackPickup) && smallEnough) {
+      // InstancedMesh support (rare in this repo, but supported)
+      if ((m as any).isInstancedMesh) {
+        const inst = m as unknown as THREE.InstancedMesh;
+        const ibox = (geom.boundingBox ?? (geom.computeBoundingBox(), geom.boundingBox))!.clone();
+        const cLocal = new THREE.Vector3();
+        ibox.getCenter(cLocal);
+
+        const m4 = new THREE.Matrix4();
+        const pos = new THREE.Vector3();
+        const quat = new THREE.Quaternion();
+        const scl = new THREE.Vector3();
+
+        const count = Math.min(inst.count ?? 0, 220);
+        for (let i = 0; i < count; i++) {
+          inst.getMatrixAt(i, m4);
+          m4.decompose(pos, quat, scl);
+
+          // Approximate instance size by scale
+          const sx = Math.abs(scl.x);
+          const sy = Math.abs(scl.y);
+          const sz = Math.abs(scl.z);
+
+          const instMaxDim = maxDim * Math.max(sx, sy, sz);
+          if (instMaxDim > 6.0) continue;
+
+          const id = `inst::${inst.uuid}::${i}`;
+          if (this.bakedPickups.has(id)) continue;
+
+          this.bakedPickups.set(id, {
+            mesh: inst,
+            kind: keywordPickup ? "pickup" : "pickup",
+            basePos: pos.clone(),
+            centerLocal: cLocal.clone(),
+            baseY: pos.y,
+            baseRotY: 0,
+            maxDim: instMaxDim,
+            collected: false,
+            instanced: true,
+            instanceId: i,
+            baseMatrix: m4.clone()
+          });
+        }
+        return;
+      }
+
+      // Regular mesh: store bounds center in local space (pivot is often offset in this pack)
+      const centerLocal = (m as any).worldToLocal(centerW.clone());
+      const id = `${m.name || "pickup"}::${m.uuid}`;
+
+      if (!this.bakedPickups.has(id)) {
+        // Rough kind classification (not critical to gameplay, but keeps future tuning easier)
+        const kind =
+          /coin/i.test(selfLower) ? "coin" :
+          /(gem|crystal|diamond|jewel)/i.test(selfLower) ? "gem" :
+          /(question|mystery|qmark)/i.test(selfLower) ? "mystery" :
+          /(dice|\bdie\b)/i.test(selfLower) ? "dice" :
+          /(ring|hoop|torus)/i.test(selfLower) ? "ring" :
+          /(present|gift|prize|reward|box|crate|chest)/i.test(selfLower) ? "box" :
+          /(energy|lightning|bolt|zap|thunder)/i.test(selfLower) ? "energy" :
+          /(icecream|ice\s*cream|scoop|cone)/i.test(selfLower) ? "treat" :
+          "pickup";
+
+        this.bakedPickups.set(id, {
+          mesh: m,
+          kind,
+          basePos: m.position.clone(),
+          centerLocal,
+          baseY: m.position.y,
+          baseRotY: m.rotation.y,
+          maxDim,
+          collected: false
+        });
+      }
+      return;
+    }
+
+    props.push(m);
+  });
+
+  return { walkables, props, waters };
+}
+  // Build a lowercase "full name" including this object, its parents, and material names.
+  // This avoids missing important keywords when meshes have generic names (e.g. "Plane") but their parent is "Gate_*".
+  private fullLower(obj: THREE.Object3D): string {
+    const parts: string[] = [];
+    let cur: THREE.Object3D | null = obj;
+    while (cur) {
+      if (cur.name) parts.push(cur.name);
+      cur = cur.parent as any;
+    }
+    const mat: any = (obj as any).material;
+    if (mat) {
+      if (Array.isArray(mat)) {
+        for (const mm of mat) if (mm?.name) parts.push(mm.name);
+      } else if (mat?.name) {
+        parts.push(mat.name);
+      }
+    }
+    return parts.join(" ").toLowerCase();
+  }
+
+  private isTransparentMaterial(mat: any): boolean {
+    const one = (m: any): boolean => {
+      if (!m) return false;
+      if (m.transparent === true) return true;
+      const op = typeof m.opacity === "number" ? m.opacity : 1;
+      if (op < 0.995) return true;
+      if (m.depthWrite === false) return true;
+      const at = typeof m.alphaTest === "number" ? m.alphaTest : 0;
+      if (at > 0) return true;
+      return false;
+    };
+    return Array.isArray(mat) ? mat.some(one) : one(mat);
+  }
+
+
+  private dropFloatingDecorations(props: THREE.Mesh[], groundMeshes: THREE.Mesh[]): void {
+    if (!props.length || !groundMeshes.length) return;
+
+    const worldRoot = this.worldRoot;
+    const ray = new THREE.Raycaster();
+    const DOWN = new THREE.Vector3(0, -1, 0);
+
+    // Exclude things that are often intentionally "off the ground" or must keep authored alignment.
+    const EXCLUDE_RE =
+      /(backdrop|background|sky|cloud|mountain|hill|terrain|landscape|distant|water|river|lake|sea|ocean|pond|pool|doorplasma|screen|forcefield|shield|glass|window|portal|gate|arch|cane|fence|rail|wall|roof|building|tower|castle|bridge|stair|stairs|ramp|platform|floor|path|road|npc|character)/i;
+
+    const seen = new Set<string>();
+
+    const pickMoveNode = (mesh: THREE.Mesh): THREE.Object3D => {
+      const p = mesh.parent;
+      if (!p) return mesh;
+
+      // If this mesh is part of a small prop group (common for multi-mesh decorations),
+      // move the group so the whole decoration stays intact.
+      if (worldRoot && p === worldRoot) return mesh;
+      if (p.children && p.children.length > 1 && p.children.length <= 12) return p;
+
+      return mesh;
+    };
+
+    for (const m of props) {
+      const node = pickMoveNode(m);
+      if (seen.has(node.uuid)) continue;
+      seen.add(node.uuid);
+
+      const lower = this.fullLower(node);
+      if (EXCLUDE_RE.test(lower)) continue;
+
+      const box = new THREE.Box3().setFromObject(node);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      box.getSize(size);
+      box.getCenter(center);
+
+      const maxXZ = Math.max(size.x, size.z);
+      const footArea = size.x * size.z;
+
+      // Only touch tall-ish, ground-anchored decorations (trees, poles, lollipops, etc.)
+      const tall = size.y >= 0.9 && size.y >= maxXZ * 1.10;
+      const poleLike = size.y >= 1.8 && maxXZ <= 3.8;
+
+      // Never touch huge backdrop chunks.
+      const notTooHuge = size.y <= 90 && maxXZ <= 90 && footArea <= 9000;
+      if (!notTooHuge) continue;
+      if (!(tall || poleLike)) continue;
+
+      // Raycast down from above the decoration center to find the nearest walkable surface.
+      const fromY = box.max.y + Math.max(2.0, size.y * 0.75);
+      ray.set(new THREE.Vector3(center.x, fromY, center.z), DOWN);
+      const hits = ray.intersectObjects(groundMeshes, false);
+      if (!hits.length) continue;
+
+      const hit = hits[0];
+      const gap = box.min.y - hit.point.y;
+
+
+      // LOLLIPOP_TOUCH_GROUND: if the big lollipop is even slightly hovering, snap it to the ground.
+      // (We only do this for lollipops; everything else uses the existing thresholds.)
+      const isLollipop = /lollipop/i.test(lower);
+      if (isLollipop) {
+        // Drop exactly by the measured gap so the bounding-box bottom touches the ground.
+        // Guardrails: ignore tiny noise, and avoid pulling down something wildly far away.
+        if (gap > 0.001 && gap < 25.0) {
+          node.position.y -= gap;
+          node.updateMatrixWorld(true);
+        }
+        continue;
+      }
+      const isHard = /(lollipop_01003|treechocolate_01012)/i.test(lower);
+
+      // Only fix mild "hover" gaps (avoid pulling down intentional floaters).
+      const minGap = isHard ? 0.005 : 0.15;
+      if (!(gap > minGap)) continue;
+      const maxGap = poleLike ? 14.0 : 8.0;
+      if (gap > maxGap) continue;
+
+      // Shift down so the bounding-box bottom sits on the ground (tiny embed avoids z-fighting).
+      const epsilon = isHard ? 0.0 : 0.02;
+      node.position.y -= (gap - epsilon);
+      node.updateMatrixWorld(true);
+    }
+  
+    // SWEETLAND_LOLLIPOP_TOUCH_V12: force the known floating lollipop to visually touch ground.
+    // Narrow scope: only affects the single mesh named "Lollipop_01003".
+    try {
+      const __slL = (worldRoot as any)?.getObjectByName?.("Lollipop_01003");
+      if (__slL) {
+        const __node = pickMoveNode(__slL as any);
+        const __box = new THREE.Box3().setFromObject(__node);
+        const __center = new THREE.Vector3();
+        __box.getCenter(__center);
+
+        // Raycast down from above the lollipop's center.
+        const __fromY = __box.max.y + Math.max(2.0, (__box.max.y - __box.min.y) * 0.75);
+        ray.set(new THREE.Vector3(__center.x, __fromY, __center.z), DOWN);
+        const __hits = ray.intersectObjects(groundMeshes, false);
+        if (__hits.length) {
+          const __hit = __hits[0];
+          const __gap = __box.min.y - __hit.point.y;
+
+          // If it's even slightly hovering, snap it down to touch (tiny embed avoids z-fighting).
+          if (__gap > 0.0005 && __gap < 50) {
+            const __embed = 0.08;// deeper sink to overcome collider/mesh mismatch (v1)
+            (__node as any).position.y -= (__gap + __embed);
+            __node.updateMatrixWorld(true);
+          }
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+}
+
+
+
+
+
+
+
+  // SWEETLAND_LOLLIPOP_SINK_V2: force authored decorations to sit on the ground even if the
+// glb's visible mesh and the collider surface don't line up perfectly.
+private forceGroundNamedDecorations(partialNames: string[], groundCandidates: THREE.Object3D[]): void {
+  if (!this.scene) return;
+  if (!partialNames?.length || !groundCandidates?.length) return;
+
+  const ray = new THREE.Raycaster();
+  ray.far = 200;
+
+  const down = new THREE.Vector3(0, -1, 0);
+  const from = new THREE.Vector3();
+  const box = new THREE.Box3();
+  const size = new THREE.Vector3();
+
+  const hasAncestorMatch = (node: THREE.Object3D, partial: string): boolean => {
+    let p = node.parent;
+    while (p) {
+      if ((p as any).name && (p as any).name.includes(partial)) return true;
+      p = p.parent;
+    }
+    return false;
+  };
+
+  const setYToGround = (
+    node: THREE.Object3D,
+    desiredGap: number,
+    clampMin: number,
+    clampMax: number,
+    minAbsDelta: number
+  ) => {
+    // Compute world AABB for the node (handles groups).
+    box.setFromObject(node);
+    box.getSize(size);
+    if (!isFinite(box.min.y) || !isFinite(box.max.y) || size.length() < 1e-6) return;
+
+    const bottomY = box.min.y;
+    const centerX = (box.min.x + box.max.x) * 0.5;
+    const centerZ = (box.min.z + box.max.z) * 0.5;
+
+    // Raycast downward from above the object to find the ground surface y.
+    from.set(centerX, box.max.y + 8, centerZ);
+    ray.set(from, down);
+    const hits = ray.intersectObjects(groundCandidates, true);
+    if (!hits.length) return;
+    const groundY = hits[0].point.y;
+    // SWEETLAND_LOLLIPOP_SINK_V8
+    // Special-case: the Sweet Land big lollipop's bbox bottom is unreliable (often includes hidden/collider geo).
+    // Use the object's pivot (world position) and bury it by SWEETLAND_LOLLIPOP_BURY.
+    const isTargetLollipop = /lollipop_01003/i.test(node.name);
+    if (isTargetLollipop) {
+      // Reuse `from` as a temp vector to avoid allocations.
+      node.getWorldPosition(from);
+      // Recompute ground at the lollipop's pivot XZ (bbox center can be offset).
+      const pivotCastY = from.y + Math.max(12, size.y * 2);
+      from.set(from.x, pivotCastY, from.z);
+      ray.set(from, down);
+      const hits2 = ray.intersectObjects(groundCandidates, true);
+      const gY = (hits2 && hits2.length) ? hits2[0].point.y : groundY;
+      // Get pivot world pos again (ray origin overwrote `from`).
+      node.getWorldPosition(from);
+      const parentScaleY = (node.parent && node.parent.scale) ? node.parent.scale.y : 1;
+      const denom = Math.abs(parentScaleY) > 1e-6 ? parentScaleY : 1;
+      const deltaWorld = (gY - SWEETLAND_LOLLIPOP_BURY) - from.y;
+      const deltaLocal = deltaWorld / denom;
+      if (isFinite(deltaLocal) && Math.abs(deltaLocal) >= minAbsDelta) {
+        node.position.y += deltaLocal;
+        node.updateMatrixWorld(true);
+      }
+      return;
+    }
+
+
+    const currentGap = bottomY - groundY;
+    // delta to make gap = desiredGap
+    let delta = (groundY + desiredGap) - bottomY;
+
+    // Clamp delta so we don't accidentally move huge distances if we hit a weird surface.
+    delta = clamp(delta, clampMin, clampMax);
+
+    if (!isFinite(delta)) return;
+    if (Math.abs(delta) < minAbsDelta) return;
+
+    node.position.y += delta;
+    // SWEETLAND_LOLLIPOP_SINK_V5
+    // The lollipop's visible base sits higher than its bbox/collider footprint,
+    // so we force an extra downward bury to eliminate floating.
+    if (node.name === "Lollipop_01003") {
+      node.position.y -= 0.35;
+    }
+
+    node.updateMatrixWorld(true);
+  };
+
+  this.scene.traverse((node) => {
+    if (!node?.name) return;
+
+    for (const partial of partialNames) {
+      if (!partial) continue;
+      if (!node.name.includes(partial)) continue;
+
+      // Avoid double-adjusting child meshes when the parent/group already matches.
+      if (hasAncestorMatch(node, partial)) break;
+
+      const n = node.name.toLowerCase();
+      const isLollipop = n.includes("lollipop");
+      const isTreeChocolate = n.includes("treechocolate");
+
+      // Lollipops: sink deeper than the visible/collider mismatch so the stick reaches the ground.
+      const desiredGap = isLollipop ? -10.00 : isTreeChocolate ? -0.03 : 0.0; // SWEETLAND_LOLLIPOP_SINK_V3
+
+      // Allow larger downward movement for lollipops (they can be quite "floaty").
+      const dmin = isLollipop ? -10.0 : -0.1;
+      const dmax = isLollipop ? 0.00 : 0.1;
+
+      // For lollipops, even tiny offsets can be noticeable; apply smaller deadzone.
+      const minAbs = isLollipop ? 0.001 : 0.01;
+
+      setYToGround(node, desiredGap, dmin, dmax, minAbs);
+      break;
+    }
+  });
+}
+
+  private addTrimeshCollider(mesh: THREE.Mesh, opts?: { friction?: number }): void {
+    const geom = mesh.geometry as THREE.BufferGeometry;
+    const posAttr = geom.attributes.position as THREE.BufferAttribute;
+
+    const verts: number[] = new Array(posAttr.count * 3);
+    const v = new THREE.Vector3();
+    // SWEETLAND_RAINBOW_BRIDGE_FIX_V2: the bridge mesh sits slightly below its collider.
+    const bridgeBiasY = /bridge_02001/i.test(mesh.name) ? -0.05 : 0;
+    for (let i = 0; i < posAttr.count; i++) {
+      v.fromBufferAttribute(posAttr, i).applyMatrix4(mesh.matrixWorld);
+      verts[i * 3 + 0] = v.x;
+      verts[i * 3 + 1] = v.y + bridgeBiasY;
+      verts[i * 3 + 2] = v.z;
+    }
+
+    let indices: number[];
+    if (geom.index) {
+      indices = Array.from(geom.index.array as any);
+    } else {
+      indices = Array.from({ length: posAttr.count }, (_, i) => i);
+    }
+
+    // Rapier expects triangle indices
+    if (indices.length < 3) return;
+
+    const friction = opts?.friction ?? 0.9;
+    const desc = this.physics.R.ColliderDesc.trimesh(verts, indices)
+      .setTranslation(0, 0, 0)
+      .setFriction(friction);
+
+    this.physics.world.createCollider(desc, this.staticBody);
+
+    // Safety core for large walkable meshes: a slightly-shrunk box inside the trimesh
+    // helps prevent the player from slipping into cracks between adjacent tris/parts.
+    try {
+      const bb = new THREE.Box3().setFromObject(mesh);
+      const s = new THREE.Vector3();
+      const c = new THREE.Vector3();
+      bb.getSize(s);
+      bb.getCenter(c);
+      const area = s.x * s.z;
+      const maxD = Math.max(s.x, s.y, s.z);
+      if (area > 65 && s.y < 10 && maxD > 10 && !/bridge_02001/i.test(mesh.name)) {
+        const shrink = 0.985;
+        const hx = (s.x * shrink) / 2;
+        const hy = (s.y * shrink) / 2;
+        const hz = (s.z * shrink) / 2;
+        const core = this.physics.R.ColliderDesc.cuboid(hx, hy, hz)
+          .setTranslation(c.x, c.y, c.z)
+          .setFriction(opts.friction);
+        this.physics.world.createCollider(core, this.staticBody);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  private addGateFrameColliders(mesh: THREE.Mesh): void {
+    const box = new THREE.Box3().setFromObject(mesh);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+
+    // Determine "width" axis in XZ plane
+    const widthAxis: "x" | "z" = size.x >= size.z ? "x" : "z";
+    const depthAxis: "x" | "z" = widthAxis === "x" ? "z" : "x";
+
+    const width = widthAxis === "x" ? size.x : size.z;
+    const depth = depthAxis === "x" ? size.x : size.z;
+
+        // Posts on left/right (keep them slim so the opening is always walkable)
+    const halfH = Math.max(size.y * 0.5 * 0.95, 0.8);
+    const halfD = Math.max(depth * 0.5 * 0.45, 0.14);
+
+    const minGap = 1.25; // player capsule needs room
+    let postW = Math.min(0.85, Math.max(0.18, width * 0.10));
+    const maxPostWForGap = (width - minGap) / 2;
+    if (Number.isFinite(maxPostWForGap)) {
+      postW = Math.max(0.14, Math.min(postW, maxPostWForGap));
+    }
+    if (postW <= 0.06) return;
+
+    const offset = Math.max(0, width * 0.5 - postW * 0.5);
+
+const mk = (sign: number) => {
+      const cx = widthAxis === "x" ? center.x + sign * offset : center.x;
+      const cz = widthAxis === "z" ? center.z + sign * offset : center.z;
+
+      const hx = widthAxis === "x" ? postW * 0.5 : halfD;
+      const hz = widthAxis === "z" ? postW * 0.5 : halfD;
+
+      const desc = this.physics.R.ColliderDesc.cuboid(hx, halfH, hz)
+        .setTranslation(cx, center.y, cz)
+        .setFriction(1.0);
+
+      this.physics.world.createCollider(desc, this.staticBody);
+    };
+
+    mk(-1);
+    mk(1);
+  }
+
+  private addBoxCollider(mesh: THREE.Mesh, opts: { friction: number; shrink: number }): void {
+        const fullName = this.fullLower(mesh);
+
+    // Don't add solid colliders to our runtime portals (they have explicit sensors + pillar colliders).
+    if (fullName.includes("portal")) return;
+
+    // Gate/portal "screen" surfaces should be pass-through (no solid collider).
+    const candyGateish =
+      fullName.includes("cane") ||
+      fullName.includes("candycane") ||
+      fullName.includes("candy-cane") ||
+      fullName.includes("gate") ||
+      fullName.includes("arch") ||
+      fullName.includes("portal");
+
+    const looksTransparent = this.isTransparentMaterial((mesh as any).material);
+    const screenishByName =
+      fullName.includes("doorplasma") ||
+      fullName.includes("door_01") ||
+      fullName.includes("door01") ||
+      (candyGateish &&
+        (fullName.includes("plasma") ||
+          fullName.includes("screen") ||
+          fullName.includes("forcefield") ||
+          fullName.includes("shield") ||
+          fullName.includes("energy") ||
+          fullName.includes("glass") ||
+          fullName.includes("window") ||
+          looksTransparent));
+    if (screenishByName) return;
+
+    const box = new THREE.Box3().setFromObject(mesh);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
+
+    // Additional safety: some gate screens are opaque but are still a very thin panel.
+    if (candyGateish) {
+      const __dimsGate = [size.x, size.y, size.z].sort((a, b) => a - b);
+      const __a = __dimsGate[0];
+      const __b = __dimsGate[1];
+      const __c = __dimsGate[2];
+      const __den = Math.max(__a, 1e-6);
+      const __thinGatePanel =
+        __a <= 0.22 &&
+        __b / __den >= 2.4 &&
+        __c / __den >= 6.0 &&
+        __b >= 0.8 &&
+        __c >= 1.6;
+      if (__thinGatePanel) return;
+    }
+
+    // Skip extremely small props
+    const vol = size.x * size.y * size.z;
+    if (vol < 0.02) return;
+
+    // Shrink to reduce snagging
+    size.multiplyScalar(opts.shrink);
+
+    // Clamp very thin colliders (fixes the teal wall / rainbow panel "walk inside" bug)
+    const minThin = 0.28;
+    size.x = Math.max(size.x, minThin);
+    size.z = Math.max(size.z, minThin);
+    size.y = Math.max(size.y, 0.10);
+
+    const desc = this.physics.R.ColliderDesc.cuboid(size.x / 2, size.y / 2, size.z / 2)
+      .setTranslation(center.x, center.y, center.z)
+      .setFriction(opts.friction);
+
+    this.physics.world.createCollider(desc, this.staticBody);
+  }
+
+private addInstancedBoxColliders(
+  mesh: THREE.InstancedMesh,
+  opts: { friction: number; shrink: number; maxInstances?: number }
+): void {
+    const fullName = this.fullLower(mesh);
+
+  // Skip portals and gate/portal "screen" surfaces (pass-through)
+  if (fullName.includes("portal")) return;
+
+  const candyGateish =
+    fullName.includes("cane") ||
+    fullName.includes("candycane") ||
+    fullName.includes("candy-cane") ||
+    fullName.includes("gate") ||
+    fullName.includes("arch") ||
+    fullName.includes("portal");
+
+  const looksTransparent = this.isTransparentMaterial((mesh as any).material);
+  const screenishByName =
+    fullName.includes("doorplasma") ||
+    fullName.includes("door_01") ||
+    fullName.includes("door01") ||
+    (candyGateish &&
+      (fullName.includes("plasma") ||
+        fullName.includes("screen") ||
+        fullName.includes("glass") ||
+        fullName.includes("window") ||
+        fullName.includes("forcefield") ||
+        fullName.includes("energy") ||
+        fullName.includes("shield") ||
+        looksTransparent));
+  if (screenishByName) return;
+
+  const geom = mesh.geometry as THREE.BufferGeometry;
+  if (!geom) return;
+
+  if (!geom.boundingBox) geom.computeBoundingBox();
+  const bbox = geom.boundingBox!;
+  const sizeLocal = new THREE.Vector3();
+  const centerLocal = new THREE.Vector3();
+  bbox.getSize(sizeLocal);
+
+  if (candyGateish) {
+    const __dimsGate = [sizeLocal.x, sizeLocal.y, sizeLocal.z].sort((a, b) => a - b);
+    const __a = __dimsGate[0];
+    const __b = __dimsGate[1];
+    const __c = __dimsGate[2];
+    const __den = Math.max(__a, 1e-6);
+    const __thinGatePanel =
+      __a <= 0.22 &&
+      __b / __den >= 2.4 &&
+      __c / __den >= 6.0 &&
+      __b >= 0.8 &&
+      __c >= 1.6;
+    if (__thinGatePanel) return;
+  }
+
+  bbox.getCenter(centerLocal);
+
+  const maxCount = Math.min(mesh.count ?? 0, opts.maxInstances ?? 260);
+  const instM = new THREE.Matrix4();
+  const worldM = new THREE.Matrix4();
+  const pos = new THREE.Vector3();
+  const quat = new THREE.Quaternion();
+  const scl = new THREE.Vector3();
+
+  for (let i = 0; i < maxCount; i++) {
+    mesh.getMatrixAt(i, instM);
+
+    // world = mesh.matrixWorld * instM
+    worldM.copy(mesh.matrixWorld).multiply(instM);
+    worldM.decompose(pos, quat, scl);
+
+    const sx = Math.abs(scl.x);
+    const sy = Math.abs(scl.y);
+    const sz = Math.abs(scl.z);
+
+    const size = new THREE.Vector3(sizeLocal.x * sx, sizeLocal.y * sy, sizeLocal.z * sz);
+    const vol = size.x * size.y * size.z;
+    if (!isFinite(vol) || vol < 0.02) continue;
+
+    size.multiplyScalar(opts.shrink);
+
+    // Clamp thin pieces so you can't slip through
+    const minThin = 0.28;
+    size.x = Math.max(size.x, minThin);
+    size.z = Math.max(size.z, minThin);
+    size.y = Math.max(size.y, 0.10);
+
+    const centerW = centerLocal.clone().applyMatrix4(worldM);
+
+    const desc = this.physics.R.ColliderDesc.cuboid(size.x / 2, size.y / 2, size.z / 2)
+      .setTranslation(centerW.x, centerW.y, centerW.z)
+      .setFriction(opts.friction);
+
+    this.physics.world.createCollider(desc, this.staticBody);
+  }
+}
+  private findPlatformCandidates(root: THREE.Object3D): PlatformCandidate[] {
+    const list: PlatformCandidate[] = [];
+    const re = /platform|bridge|ground|floor|path|road|angle|ramp|stairs/i;
+
+    root.updateMatrixWorld(true);
+
+    root.traverse((o) => {
+      if (!(o as THREE.Mesh).isMesh) return;
+      const m = o as THREE.Mesh;
+      const name = m.name || "";
+      if (!re.test(name)) return;
+
+      const bbox = new THREE.Box3().setFromObject(m);
+      const size = new THREE.Vector3();
+      const center = new THREE.Vector3();
+      bbox.getSize(size);
+      bbox.getCenter(center);
+
+      // Flat-ish surfaces
+      if (size.x * size.z < 6) return;
+      if (size.y > 8) return;
+
+      list.push({
+        obj: m,
+        name,
+        bbox,
+        size,
+        center,
+        topY: bbox.max.y,
+        area: size.x * size.z
+      });
+    });
+
+    // Sort by area desc
+    list.sort((a, b) => b.area - a.area);
+    return list;
+  }
+
+  private pickHubPlatform(candidates: PlatformCandidate[]): PlatformCandidate {
+    // Prefer big platform near origin
+    let best = candidates[0];
+    let bestScore = -Infinity;
+    for (const c of candidates.slice(0, 40)) {
+      const d = c.center.length();
+      const score = c.area - d * 0.35; // big + near center
+      if (score > bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    }
+    return best!;
+  }
+
+  private pickPortalPlatforms(candidates: PlatformCandidate[], hub: PlatformCandidate): Record<string, PlatformCandidate> {
+    // Choose 4 platforms around the hub in quadrants: NW, NE, SW, SE
+    const picks: Record<string, PlatformCandidate | null> = { NW: null, NE: null, SW: null, SE: null };
+
+    const hubC = hub.center.clone();
+    for (const c of candidates.slice(0, 120)) {
+      if (c === hub) continue;
+      const dx = c.center.x - hubC.x;
+      const dz = c.center.z - hubC.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist < 12 || dist > 120) continue;
+
+      const key =
+        dx < 0 && dz < 0 ? "NW" :
+        dx >= 0 && dz < 0 ? "NE" :
+        dx < 0 && dz >= 0 ? "SW" : "SE";
+
+      const cur = picks[key as keyof typeof picks];
+      // pick the biggest area in each quadrant
+      if (!cur || c.area > cur.area) picks[key as keyof typeof picks] = c;
+    }
+
+    // Fallback: if any quadrant missing, just pick next best
+    const used = new Set<PlatformCandidate>([hub]);
+    for (const k of Object.keys(picks) as (keyof typeof picks)[]) {
+      if (picks[k]) used.add(picks[k]!);
+    }
+    for (const k of Object.keys(picks) as (keyof typeof picks)[]) {
+      if (picks[k]) continue;
+      const fallback = candidates.find((c) => !used.has(c) && Math.hypot(c.center.x - hubC.x, c.center.z - hubC.z) > 12);
+      if (fallback) {
+        picks[k] = fallback;
+        used.add(fallback);
+      }
+    }
+
+    // Map to portfolio IDs
+    // Projects=NW, Work=NE, Collabs=SW, Contact=SE
+    const out: Record<string, PlatformCandidate> = {
+      projects: picks.NW!,
+      work: picks.NE!,
+      collabs: picks.SW!,
+      contact: picks.SE!
+    };
+
+    // Teleport spots
+    this._portalSpots.set("projects", out.projects.center.clone().setY(out.projects.topY + 1.4));
+    this._portalSpots.set("work", out.work.center.clone().setY(out.work.topY + 1.4));
+    this._portalSpots.set("collabs", out.collabs.center.clone().setY(out.collabs.topY + 1.4));
+    this._portalSpots.set("contact", out.contact.center.clone().setY(out.contact.topY + 1.4));
+
+    return out;
+  }
+  private addJumpBridgeSlab(root: THREE.Object3D): void {
+    // Adds a SECOND "bridge" slab that the player can jump to.
+    // If the user saved an anchor point (Shift+J), we place slab02 mid-air between
+    // that anchor and the nearest existing waffle slab, at the waffle slab's height.
+    // This lets you place an in-air slab even though you can't stand in midair.
+
+    // Read a saved anchor from localStorage (robust to different key names).
+    const readSlab02Anchor = (): { x: number; y: number; z: number; rotY?: number } | null => {
+      if (typeof window === "undefined") return null;
+      const keys = [
+        "sweetland:slab02",
+        "sweetland:slab02Override",
+        "sweetland:slab02_override",
+        "sweetland_slab02",
+        "sweetland_slab02_override",
+        "sweetland_slab02Override",
+        "sweetland_slab02Pos",
+        "sweetland:slab02Pos",
+        "slab02",
+        "slab02Override"
+      ];
+      for (const k of keys) {
+        try {
+          const raw = window.localStorage.getItem(k);
+          if (!raw) continue;
+          const obj = JSON.parse(raw);
+          const p = obj?.spawn ?? obj?.pos ?? obj?.position ?? obj;
+          const x = Number(p?.x);
+          const y = Number(p?.y);
+          const z = Number(p?.z);
+          if ([x, y, z].every((n) => Number.isFinite(n))) {
+            return { x, y, z, rotY: Number(p?.rotY ?? p?.ry ?? obj?.rotY ?? obj?.ry) };
+          }
+        } catch {
+          // ignore
+        }
+      }
+      return null;
+    };
+
+    // Collect solid-ish instances so we can "pick" a good waffle slab near an anchor.
+    type SolidPick = {
+      mesh: THREE.InstancedMesh;
+      name: string;
+      center: THREE.Vector3;
+      size: THREE.Vector3;
+      topY: number;
+      sx: number;
+      sy: number;
+      sz: number;
+      quat: THREE.Quaternion;
+      scale: THREE.Vector3;
+    };
+
+    const solids: SolidPick[] = [];
+    root.updateMatrixWorld(true);
+    const instM = new THREE.Matrix4();
+    const worldM = new THREE.Matrix4();
+    const pos = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const scl = new THREE.Vector3();
+
+    root.traverse((o) => {
+      if (!(o as any).isInstancedMesh) return;
+      const im = o as unknown as THREE.InstancedMesh;
+      const fullName = (im.name || "") + " " + ((im.parent && (im.parent as any).name) || "");
+      const nameLower = fullName.toLowerCase();
+      // Only consider things that could plausibly be jumped onto.
+      if (!/(waffle|slab|platform|bridge|step|tile)/i.test(nameLower)) return;
+
+      const geom = im.geometry as THREE.BufferGeometry;
+      if (!geom) return;
+      if (!geom.boundingBox) geom.computeBoundingBox();
+      const bbox = geom.boundingBox!;
+      const sizeLocal = new THREE.Vector3();
+      const centerLocal = new THREE.Vector3();
+      bbox.getSize(sizeLocal);
+      bbox.getCenter(centerLocal);
+
+      const maxCount = Math.min((im.count ?? 0) as number, 260);
+      for (let i = 0; i < maxCount; i++) {
+        im.getMatrixAt(i, instM);
+        worldM.copy(im.matrixWorld).multiply(instM);
+        worldM.decompose(pos, quat, scl);
+
+        const sx = Math.abs(scl.x);
+        const sy = Math.abs(scl.y);
+        const sz = Math.abs(scl.z);
+        const sizeW = new THREE.Vector3(sizeLocal.x * sx, sizeLocal.y * sy, sizeLocal.z * sz);
+        const vol = sizeW.x * sizeW.y * sizeW.z;
+        if (!isFinite(vol) || vol < 0.08) continue;
+
+        // Filter out huge floors and very tall columns.
+        if (sizeW.y > 10) continue;
+        if (sizeW.x * sizeW.z > 900) continue;
+
+        const centerW = centerLocal.clone().applyMatrix4(worldM);
+        solids.push({
+          mesh: im,
+          name: im.name || "",
+          center: centerW,
+          size: sizeW,
+          topY: centerW.y + sizeW.y / 2,
+          sx: sizeW.x,
+          sy: sizeW.y,
+          sz: sizeW.z,
+          quat: quat.clone(),
+          scale: scl.clone()
+        });
+      }
+    });
+
+    const findSolidNear = (
+      origin: THREE.Vector3,
+      radius: number,
+      nameRe: RegExp,
+      extraFilter?: (s: SolidPick) => boolean
+    ): SolidPick | null => {
+      let best: SolidPick | null = null;
+      let bestScore = Infinity;
+      const r2 = radius * radius;
+      for (const s of solids) {
+        const n = (s.name || "").toLowerCase();
+        if (!nameRe.test(n)) continue;
+        if (extraFilter && !extraFilter(s)) continue;
+        const dx = s.center.x - origin.x;
+        const dz = s.center.z - origin.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 > r2) continue;
+        // Prefer closer, and prefer slab-ish sizes.
+        const slabLike = Math.abs(s.sx - 2.37) + Math.abs(s.sz - 2.37) + Math.abs(s.sy - 1.54);
+        const score = d2 + slabLike * 2.0;
+        if (score < bestScore) {
+          bestScore = score;
+          best = s;
+        }
+      }
+      return best;
+    };
+
+    // Default anchor comes from the portal platform logic (older behavior).
+    const platforms = this.findPlatformCandidates(root);
+    if (!platforms.length) return;
+    const hub = this.pickHubPlatform(platforms);
+    const portals = this.pickPortalPlatforms(platforms, hub);
+    const portalPlatform = portals.NE ?? hub;
+    const contactAnchor = portalPlatform.center.clone();
+
+    // Override anchor if user saved one.
+    const saved = readSlab02Anchor();
+    const anchor = saved
+      ? new THREE.Vector3(saved.x, saved.y, saved.z)
+      : contactAnchor;
+
+    // Find nearest waffle slab near the anchor.
+    const slabPick =
+      findSolidNear(anchor, 70, /waffle/i) ||
+      findSolidNear(anchor, 70, /slab/i, (s) => s.sx <= 6 && s.sz <= 6 && s.sy <= 4);
+
+    if (!slabPick) {
+      console.warn("[SweetLand] Could not find a waffle slab near anchor for slab02.");
+      return;
+    }
+
+    // Place slab02 between anchor and slabPick, at the slabPick height.
+    const slabTopY = slabPick.topY;
+    const slabCenterY = slabTopY - slabPick.sy / 2;
+    const a = anchor.clone();
+    a.y = slabTopY;
+    const s = slabPick.center.clone();
+    s.y = slabTopY;
+
+    // Midpoint in XZ; keep at same Y (slabTopY).
+    const mid = a.clone().lerp(s, 0.5);
+    mid.y = slabCenterY;
+
+    // Build a visible mesh that matches the original slab instance.
+    const bridge = new THREE.Mesh(slabPick.mesh.geometry, slabPick.mesh.material as any);
+    bridge.name = "SweetLand_BridgeSlab02";
+    bridge.position.copy(mid);
+    bridge.quaternion.copy(slabPick.quat);
+    bridge.scale.copy(slabPick.scale);
+    (bridge as any).castShadow = true;
+    (bridge as any).receiveShadow = true;
+    this.scene.add(bridge);
+
+    // Add a static collider so the player can stand on it.
+    try {
+      const desc = this.physics.R.ColliderDesc.cuboid(slabPick.sx / 2, slabPick.sy / 2, slabPick.sz / 2)
+        .setTranslation(mid.x, mid.y, mid.z)
+        .setFriction(1.0);
+      this.physics.world.createCollider(desc, this.staticBody);
+    } catch (e) {
+      console.warn("[SweetLand] Failed to create slab02 collider:", e);
+    }
+
+    console.log("[SweetLand] Added slab02 between anchor and waffle slab.", {
+      anchor: { x: a.x, y: a.y, z: a.z },
+      waffle: { x: s.x, y: s.y, z: s.z, topY: slabTopY },
+      slab02: { x: mid.x, y: mid.y, z: mid.z }
+    });
+  }
+
+  private async createPortals(
+    portalPlatforms: Record<string, PlatformCandidate>,
+    onProgress?: (p01: number) => void
+  ): Promise<void> {
+    // Load portal model once (Gate_01), then clone 4x
+    let portalBase: THREE.Object3D | null = null;
+    try {
+      if (ASSETS.portalModel) {
+        const g = await loadGLTF(ASSETS.portalModel);
+        portalBase = g.scene;
+      }
+    } catch {
+      portalBase = null;
+    }
+
+    const ids = ["projects", "work", "collabs", "contact"] as const;
+
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      const sec = PORTFOLIO_SECTIONS.find((s) => s.id === id)!;
+      const platform = portalPlatforms[id];
+      const hard = this.hardPortal(id);
+      const pos = (hard ? hard.pos.clone() : platform.center.clone());
+      pos.y = hard ? hard.pos.y : platform.topY; // sit on top
+
+      // Keep teleport spot aligned with the portal position
+      this._portalSpots.set(id, pos.clone().setY(pos.y + 1.4));
+
+      const group = new THREE.Group();
+      group.name = `portal_${id}`;
+      group.position.copy(pos);
+      group.rotation.y = hard ? hard.rotY : 0;
+
+      // Model
+      if (portalBase) {
+        const clone = portalBase.clone(true);
+        clone.traverse((o) => {
+          if ((o as THREE.Mesh).isMesh) {
+            (o as THREE.Mesh).castShadow = true;
+            (o as THREE.Mesh).receiveShadow = true;
+          }
+        });
+        // Scale to a reasonable size (Gate is often big)
+        const b = new THREE.Box3().setFromObject(clone);
+        const s = new THREE.Vector3();
+        b.getSize(s);
+        const targetH = 5.2;
+        const scale = s.y > 0 ? targetH / s.y : 1;
+        clone.scale.setScalar(scale);
+        group.add(clone);
+
+        // Solid colliders for the candy-cane arch (pillars + top) — robust and rotation-correct for portals 1–4.
+// Note: we use a dedicated fixed rigid-body so the colliders rotate with the portal.
+group.updateMatrixWorld(true);
+
+// Compute bounds in portal-local space (not world AABB), so collider sizing is stable even when the portal is rotated.
+const gateBoxWorld = new THREE.Box3().setFromObject(clone);
+const invPortal = new THREE.Matrix4().copy(group.matrixWorld).invert();
+const gateBox = gateBoxWorld.clone().applyMatrix4(invPortal);
+const gateSize = new THREE.Vector3();
+const gateCenter = new THREE.Vector3();
+gateBox.getSize(gateSize);
+gateBox.getCenter(gateCenter);
+
+// Fixed body for this portal's solid colliders (rotation-aware).
+const rotY = group.rotation.y;
+const qy = Math.sin(rotY * 0.5);
+const qw = Math.cos(rotY * 0.5);
+const portalBody = this.physics.world.createRigidBody(
+  this.physics.R.RigidBodyDesc.fixed()
+    .setTranslation(group.position.x, group.position.y, group.position.z)
+    .setRotation({ x: 0, y: qy, z: 0, w: qw })
+);
+
+// Heuristic sizes based on model bounds (portal-local).
+const widthAxis: "x" | "z" = gateSize.x >= gateSize.z ? "x" : "z";
+const depthAxis: "x" | "z" = widthAxis === "x" ? "z" : "x";
+const width = widthAxis === "x" ? gateSize.x : gateSize.z;
+const depth = depthAxis === "x" ? gateSize.x : gateSize.z;
+
+// Make colliders slightly "fatter" than the visible candy cane so you don't visually clip into it.
+const padW = 0.06;
+const padD = 0.06;
+
+const pillarW = Math.min(1.05, Math.max(0.34, width * 0.12));
+const pillarD = Math.min(0.95, Math.max(0.34, depth * 0.32));
+const pillarH = gateSize.y * 0.96;
+
+const minW = widthAxis === "x" ? gateBox.min.x : gateBox.min.z;
+const maxW = widthAxis === "x" ? gateBox.max.x : gateBox.max.z;
+
+const left = minW + pillarW * 0.5;
+const right = maxW - pillarW * 0.5;
+const yCenter = gateBox.min.y + pillarH * 0.5;
+
+const halfW = pillarW * 0.5;
+const halfH = pillarH * 0.5;
+const halfD = pillarD * 0.5;
+
+const mkPillarLocal = (t: number) => {
+  const x = widthAxis === "x" ? t : gateCenter.x;
+  const z = widthAxis === "z" ? t : gateCenter.z;
+  const hx = widthAxis === "x" ? halfW : halfD;
+  const hz = widthAxis === "x" ? halfD : halfW;
+  return this.physics.R.ColliderDesc.cuboid(hx + padW, halfH, hz + padD)
+    .setTranslation(x, yCenter, z)
+    .setFriction(1.1);
+};
+
+this.physics.world.createCollider(mkPillarLocal(left), portalBody);
+this.physics.world.createCollider(mkPillarLocal(right), portalBody);
+
+// Top beam to prevent clipping into the curved arch.
+const beamH = Math.min(0.45, Math.max(0.26, gateSize.y * 0.10));
+const beamY = gateBox.max.y - beamH * 0.5 - 0.02;
+const beamHalfW = width * 0.5 + 0.02;
+const beamHalfD = pillarD * 0.5 + 0.06;
+
+const beamHx = widthAxis === "x" ? beamHalfW : beamHalfD;
+const beamHz = widthAxis === "x" ? beamHalfD : beamHalfW;
+
+this.physics.world.createCollider(
+  this.physics.R.ColliderDesc.cuboid(beamHx, beamH * 0.5, beamHz)
+    .setTranslation(gateCenter.x, beamY, gateCenter.z)
+    .setFriction(1.1),
+  portalBody
+);
+
+      } else {
+        // Fallback: simple arch
+        const arch = new THREE.Mesh(
+          new THREE.TorusGeometry(1.7, 0.22, 16, 60, Math.PI),
+          new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.6, emissive: 0x111111, emissiveIntensity: 0.2 })
+        );
+        arch.rotation.x = Math.PI * 0.5;
+        arch.position.y = 2.6;
+        group.add(arch);
+      }
+
+      // Floating label (always)
+      const label = this.makeFloatingLabel(sec.title);
+      label.position.set(0, 5.6, 0);
+      group.add(label);
+
+      this.scene.add(group);
+
+      // Sensor collider around portal
+      const sensorDesc = this.physics.R.ColliderDesc.cylinder(1.6, 1.9)
+        .setTranslation(group.position.x, group.position.y + 2.0, group.position.z);
+      const sensor = this.physics.world.createCollider(sensorDesc);
+      sensor.setSensor(true);
+      sensor.setActiveEvents(this.physics.R.ActiveEvents.COLLISION_EVENTS | this.physics.R.ActiveEvents.INTERSECTION_EVENTS);
+      this.physics.tagCollider(sensor, { kind: "portal", id });
+
+      const teleportTo = pos.clone().add(new THREE.Vector3(0, 2.0, 0));
+      this.portals.set(id, { group, sensor, teleportTo });
+
+      onProgress?.(0.72 + 0.10 * ((i + 1) / ids.length));
+    }
+  }
+
+  private makeFloatingLabel(text: string): THREE.Mesh {
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 256;
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "rgba(18,24,33,0.78)";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = "rgba(255,255,255,0.30)";
+    ctx.lineWidth = 8;
+    ctx.strokeRect(12, 12, canvas.width - 24, canvas.height - 24);
+    ctx.fillStyle = "white";
+    ctx.font = "900 72px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+
+    const mesh = new THREE.Mesh(
+      new THREE.PlaneGeometry(3.4, 1.7),
+      new THREE.MeshBasicMaterial({ map: tex, transparent: true })
+    );
+    mesh.rotation.y = Math.PI; // face camera-ish; camera can orbit so it's okay
+    return mesh;
+  }
+  private seedCoins(hub: PlatformCandidate, portalPlatforms: Record<string, PlatformCandidate>): void {
+    // NOTE:
+    // We intentionally do not spawn any procedural coin *rings* (hub/portal).
+    // Portals can move during iteration, and ring spawns can be left behind in old spots.
+    // All coins should come from baked collectibles in the scene/GLBs.
+    void hub;
+    void portalPlatforms;
+
+    this.coinSpawn = [];
+    this.respawnCoins();
+  }
+  private createCoin(id: string, pos: THREE.Vector3): void {
+    const mesh = coinMesh();
+    mesh.position.copy(pos);
+    mesh.name = id;
+    this.scene.add(mesh);
+
+    const sensorDesc = this.physics.R.ColliderDesc.ball(0.6).setTranslation(pos.x, pos.y, pos.z);
+    const sensor = this.physics.world.createCollider(sensorDesc);
+    sensor.setSensor(true);
+    sensor.setActiveEvents(this.physics.R.ActiveEvents.COLLISION_EVENTS | this.physics.R.ActiveEvents.INTERSECTION_EVENTS);
+    this.physics.tagCollider(sensor, { kind: "coin", id });
+
+    this.coins.set(id, { mesh, sensor, baseY: pos.y });
+  }
+
+
+private async addNPCs(
+  hub: PlatformCandidate,
+  platformCandidates: PlatformCandidate[],
+  onProgress?: (p01: number) => void
+): Promise<void> {
+  // Build NPC list from assets config (one NPC per GLB)
+  const models = (ASSETS.npcModels ?? []).filter(Boolean);
+  if (!models.length) return;
+
+  const titleCase = (s: string) =>
+    s
+      .replace(/_/g, " ")
+      .replace(/\b\w/g, (m) => m.toUpperCase())
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const npcSpots = models.map((model, i) => {
+    const file = model.split("/").pop() ?? `npc_${i + 1}`;
+    const baseName = file.replace(/\.glb$/i, "");
+    const id = baseName.toLowerCase();
+    const name = titleCase(baseName);
+    return { id, name, model };
+  });
+
+  // --- Auto placement rules (Option A)
+  // - Spread NPCs around the hub "candy island".
+  // - Never place on bridges/ramps.
+  // - Only Candy King + Nutty Knight are allowed on the throne platform.
+  const KING_ID = "candy_king";
+  const KNIGHT_ID = "nutty_knight";
+
+// --- Hardcoded placements (your captured poses) ---------------------------
+// These override BOTH auto-placement and any saved localStorage placements.
+// You can extend this list as you capture more NPC poses.
+const HARD_FIXED: Record<string, { pos: { x: number; y: number; z: number }; rotY: number }> = {
+  // Eyebuds (snails)
+  eyebud_01: { pos: { x: -20.19,  y: -0.274, z: 14.44  }, rotY: -0.202 },
+  eyebud_02: { pos: { x: 5.774, y: -0.592, z: -25.014 }, rotY: -0.734 },
+  eyebud_03: { pos: { x: 36.392, y: 8.06, z: 54.975 }, rotY: -2.832 },
+  eyebude_03: { pos: { x: 36.392, y: 8.06, z: 54.975 }, rotY: -2.832 },
+
+  // Gruumy / Grummy (support both spellings as keys)
+  gruumy_01: { pos: { x: -16.842, y:  8.121, z: 61.443 }, rotY: -1.613 },
+  gruumy_02: { pos: { x:  -4.563, y: 10.06,  z: 36.158 }, rotY:  0.154 },
+  gruumy_03: { pos: { x:  14.315, y: 16.058, z: -50.385 }, rotY:  2.251 },
+  gruumy_04: { pos: { x: -34.903, y:  6.06,  z: -11.606 }, rotY:  3.125 },
+  gruumy_05: { pos: { x: -13.161, y:  7.56,  z: -45.463 }, rotY: -0.43  },
+
+  grummy_01: { pos: { x: -16.842, y:  8.121, z: 61.443 }, rotY: -1.613 },
+  grummy_02: { pos: { x:  -4.563, y: 10.06,  z: 36.158 }, rotY:  0.154 },
+  grummy_03: { pos: { x:  14.315, y: 16.058, z: -50.385 }, rotY:  2.251 },
+  grummy_04: { pos: { x: -34.903, y:  6.06,  z: -11.606 }, rotY:  3.125 },
+  grummy_05: { pos: { x: -13.161, y:  7.56,  z: -45.463 }, rotY: -0.43  },
+
+  // Gummibears
+  gummibear_01: { pos: { x:  52.093, y:  1.674, z: 55.746 }, rotY: -2.023 },
+  gummibear_02: { pos: { x:  40.035, y:  2.801, z: 19.451 }, rotY: -1.332 },
+  gummibear_03: { pos: { x:  10.774, y:  2.898, z: -75.753 }, rotY:  0.118 },
+  gummibear_04: { pos: { x: -43.173, y:  2.452, z: -51.359 }, rotY:  0.778 },
+  gummibear_05: { pos: { x: -50.692, y:  1.639, z: -27.03  }, rotY: -2.659 },
+  gummibear_06: { pos: { x: -54.622, y:  1.549, z: 41.376 }, rotY:  1.944 },
+
+  // Alias keys (in case the GLB files use "gummybear" spelling)
+  gummybear_01: { pos: { x:  52.093, y:  1.674, z: 55.746 }, rotY: -2.023 },
+  gummybear_02: { pos: { x:  40.035, y:  2.801, z: 19.451 }, rotY: -1.332 },
+  gummybear_03: { pos: { x:  10.774, y:  2.898, z: -75.753 }, rotY:  0.118 },
+  gummybear_04: { pos: { x: -43.173, y:  2.452, z: -51.359 }, rotY:  0.778 },
+  gummybear_05: { pos: { x: -50.692, y:  1.639, z: -27.03  }, rotY: -2.659 },
+  gummybear_06: { pos: { x: -54.622, y:  1.549, z: 41.376 }, rotY:  1.944 },
+
+  // Marshies
+  marshie_01: { pos: { x:  25.147, y: 14.06,  z: 35.632 }, rotY: -1.315 },
+  marshie_02: { pos: { x:  21.93,  y: 12.06,  z: -36.946 }, rotY:  1.918 },
+  marshie_03: { pos: { x: -24.963, y: 12.06,  z: -17.805 }, rotY: -2.978 },
+// Sweeties
+sweetie_03: { pos: { x: -23.207, y: 17.059, z: -30.268 }, rotY: -2.707 },
+
+// Sweetblooms / Sweetbloons (support both spellings)
+sweetbloom_01: { pos: { x: -45.703, y:  6.06,  z: -23.123 }, rotY:  2.033 },
+sweetbloom_02: { pos: { x: -33.51,  y:  3.121, z:  27.561 }, rotY: -1.493 },
+sweetbloom_03: { pos: { x:  37.43,  y: 14.06,  z:  35.376 }, rotY: -1.529 },
+
+sweetbloon_01: { pos: { x: -45.703, y:  6.06,  z: -23.123 }, rotY:  2.033 },
+sweetbloon_02: { pos: { x: -33.51,  y:  3.121, z:  27.561 }, rotY: -1.493 },
+sweetbloon_03: { pos: { x:  37.43,  y: 14.06,  z:  35.376 }, rotY: -1.529 },
+
+// Candy King (override throne auto placement for this test)
+candy_king: { pos: { x: 34.034, y: 16.94, z: 3.176 }, rotY: -1.438 },
+
+  // Nutty Knight (override the throne-room auto placement for this test)
+  nutty_knight: { pos: { x: 26.111, y: 14.06, z: 6.346 }, rotY: -1.881 },
+};
+
+const getHard = (id: string) => {
+  const key = (id || "").toLowerCase();
+  return (HARD_FIXED as any)[key] as { pos: { x: number; y: number; z: number }; rotY: number } | undefined;
+};
+// -------------------------------------------------------------------------
+
+  const hubCenter = hub.center.clone();
+  const HUB_RADIUS = 95; // tuned to cover the minimap hub area
+  const MIN_DIST = 2.4;
+
+  const lower = (s: string) => (s || "").toLowerCase();
+  const isBadSurfaceName = (name: string) => /(bridge|ramp|stairs|stair|angle|path|road)/i.test(name);
+
+  // Filter candidate surfaces to "candy island" platforms.
+  const allowedPlatforms = platformCandidates
+    .filter((p) => {
+      const n = lower(p.name);
+      if (isBadSurfaceName(n)) return false;
+      if (/water|river|lake|sea|ocean|pond|stream|canal|pool/i.test(n)) return false;
+      if (p.area < 18) return false;
+      if (p.area > 2400) return false; // avoid huge terrain chunks
+      const dx = p.center.x - hubCenter.x;
+      const dz = p.center.z - hubCenter.z;
+      if (dx * dx + dz * dz > HUB_RADIUS * HUB_RADIUS) return false;
+      // Keep only surfaces that are plausibly walkable "platforms"
+      const thinEnough = p.size.y < 4.5;
+      const wideEnough = Math.min(p.size.x, p.size.z) > 3.0;
+      return thinEnough && wideEnough;
+    })
+    .sort((a, b) => b.area - a.area);
+
+  // Seeded RNG (deterministic placements; stable across reloads)
+  const makeRng = (seed: number) => {
+    let x = seed >>> 0;
+    return () => {
+      // xorshift32
+      x ^= x << 13;
+      x ^= x >>> 17;
+      x ^= x << 5;
+      return ((x >>> 0) % 1_000_000) / 1_000_000;
+    };
+  };
+
+  const ray = new THREE.Raycaster();
+  const DOWN = new THREE.Vector3(0, -1, 0);
+
+  const raycastDownOn = (obj: THREE.Object3D, x: number, z: number, fromY: number) => {
+    ray.set(new THREE.Vector3(x, fromY, z), DOWN);
+    const hits = ray.intersectObject(obj, true);
+    return hits && hits.length ? hits[0] : null;
+  };
+
+  const isFlatHit = (hit: THREE.Intersection) => {
+    if (!hit.face) return true;
+    const n = hit.face.normal.clone();
+    n.transformDirection((hit.object as any).matrixWorld);
+    return n.y >= 0.92; // reject ramps/steep slopes
+  };
+
+  const hasClearance = (plat: PlatformCandidate, p: THREE.Vector3) => {
+    // Test that a "footprint" around the point stays on the same surface.
+    const baseY = p.y;
+    const offsets: [number, number][] = [
+      [0.9, 0],
+      [-0.9, 0],
+      [0, 0.9],
+      [0, -0.9],
+      [0.65, 0.65],
+      [0.65, -0.65],
+      [-0.65, 0.65],
+      [-0.65, -0.65]
+    ];
+    for (const [dx, dz] of offsets) {
+      const h = raycastDownOn(plat.obj, p.x + dx, p.z + dz, baseY + 8);
+      if (!h) return false;
+      if (!isFlatHit(h)) return false;
+      if (Math.abs(h.point.y - baseY) > 0.35) return false;
+    }
+    return true;
+  };
+
+  const samplePointOnPlatform = (plat: PlatformCandidate, rng: () => number) => {
+    const m = 1.2;
+    const minX = plat.bbox.min.x + m;
+    const maxX = plat.bbox.max.x - m;
+    const minZ = plat.bbox.min.z + m;
+    const maxZ = plat.bbox.max.z - m;
+    if (!(minX < maxX && minZ < maxZ)) return null;
+
+    for (let k = 0; k < 55; k++) {
+      const x = minX + (maxX - minX) * rng();
+      const z = minZ + (maxZ - minZ) * rng();
+      const h = raycastDownOn(plat.obj, x, z, plat.topY + 25);
+      if (!h) continue;
+      if (!isFlatHit(h)) continue;
+      const p = h.point.clone();
+      // Avoid placing below the world / in water.
+      if (p.y < -2) continue;
+      if (!hasClearance(plat, p)) continue;
+      return p;
+    }
+    return null;
+  };
+
+  const dist2 = (a: THREE.Vector3, b: THREE.Vector3) => {
+    const dx = a.x - b.x;
+    const dz = a.z - b.z;
+    return dx * dx + dz * dz;
+  };
+
+  const tooClose = (p: THREE.Vector3, placed: THREE.Vector3[]) => {
+    for (const q of placed) {
+      if (dist2(p, q) < MIN_DIST * MIN_DIST) return true;
+    }
+    return false;
+  };
+
+  const pickThroneAnchor = () => {
+    const root = this.worldRoot;
+    if (!root) return null;
+
+    const tryRegexes: RegExp[] = [/throne/i, /king.*chair|royal.*chair|chair.*king/i, /chair|seat/i];
+
+    for (const re of tryRegexes) {
+      let best: { obj: THREE.Object3D; center: THREE.Vector3; maxY: number } | null = null;
+      root.traverse((o) => {
+        const n = lower(o.name || "");
+        if (!re.test(n)) return;
+
+        // Quick reject: only consider things near the hub.
+        const box = new THREE.Box3().setFromObject(o);
+        if (!isFinite(box.min.x) || !isFinite(box.max.x)) return;
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        const dx = center.x - hubCenter.x;
+        const dz = center.z - hubCenter.z;
+        if (dx * dx + dz * dz > (HUB_RADIUS + 35) * (HUB_RADIUS + 35)) return;
+
+        const maxY = box.max.y;
+        if (!best || maxY > best.maxY) best = { obj: o, center, maxY };
+      });
+      if (best) return best.center;
+    }
+
+    return null;
+  };
+
+  const pickThronePlatform = (anchor: THREE.Vector3 | null) => {
+    const onXZ = (p: PlatformCandidate, v: THREE.Vector3) =>
+      v.x >= p.bbox.min.x && v.x <= p.bbox.max.x && v.z >= p.bbox.min.z && v.z <= p.bbox.max.z;
+
+    if (anchor) {
+      // Pick the highest platform whose XZ bounds contain the anchor.
+      let best: PlatformCandidate | null = null;
+      for (const p of allowedPlatforms) {
+        if (!onXZ(p, anchor)) continue;
+        if (!best || p.topY > best.topY) best = p;
+      }
+      if (best) return best;
+    }
+
+    // Fallback: choose the highest platform in the hub radius.
+    let best: PlatformCandidate | null = null;
+    for (const p of allowedPlatforms) {
+      if (!best || p.topY > best.topY) best = p;
+    }
+    return best;
+  };
+
+  const weightedPick = (plats: PlatformCandidate[], rng: () => number) => {
+    const weights = plats.map((p) => Math.sqrt(Math.max(1, p.area)));
+    const sum = weights.reduce((a, b) => a + b, 0);
+    let r = rng() * sum;
+    for (let i = 0; i < plats.length; i++) {
+      r -= weights[i];
+      if (r <= 0) return plats[i];
+    }
+    return plats[plats.length - 1];
+  };
+
+  // Compute placements if not present in localStorage.
+  const placementsKey = "sweetland:npcAutoPlacements:v2_hardFixed_test1";
+  const placementsObj: Record<string, { pos: { x: number; y: number; z: number }; rotY: number }> = {};
+
+  const loadPlacements = () => {
+    try {
+      if (typeof localStorage === "undefined") return false;
+      const raw = localStorage.getItem(placementsKey);
+      if (!raw) return false;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return false;
+      for (const s of npcSpots) {
+        const it = (parsed as any)[s.id];
+        if (!it || !it.pos) continue;
+        const x = Number(it.pos.x);
+        const y = Number(it.pos.y);
+        const z = Number(it.pos.z);
+        if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
+        placementsObj[s.id] = { pos: { x, y, z }, rotY: Number(it.rotY) || 0 };
+      }
+      return Object.keys(placementsObj).length > 0;
+    } catch {
+      return false;
+    }
+  };
+
+  const savePlacements = () => {
+    try {
+      if (typeof localStorage === "undefined") return;
+      localStorage.setItem(placementsKey, JSON.stringify(placementsObj));
+    } catch {
+      // ignore
+    }
+  };
+
+  const downloadPlacements = () => {
+    try {
+      const data = JSON.stringify(placementsObj, null, 2);
+      const blob = new Blob([data], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "npc_placements.json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      console.info("[SweetLand] Downloaded npc_placements.json");
+    } catch (e) {
+      console.warn("[SweetLand] Failed to download placements", e);
+    }
+  };
+
+  // Expose helpers globally (so you can always grab placements).
+  try {
+    (globalThis as any).__sweetlandDownloadNpcPlacements = downloadPlacements;
+    (globalThis as any).__sweetlandGetNpcPlacements = () => placementsObj;
+    (globalThis as any).__sweetlandClearNpcPlacements = () => {
+      try {
+        if (typeof localStorage !== "undefined") localStorage.removeItem(placementsKey);
+      } catch {}
+      console.info("[SweetLand] Cleared saved NPC placements. Reload to re-generate.");
+    };
+  } catch {}
+
+  let hadSaved = loadPlacements();
+
+// Apply hard-fixed placements immediately (even if localStorage already had something saved).
+// This lets you verify hardcoded positions without having to clear storage.
+for (const s of npcSpots) {
+  const hard = getHard(s.id);
+  if (!hard) continue;
+  placementsObj[s.id] = {
+    pos: { x: Number(hard.pos.x), y: Number(hard.pos.y), z: Number(hard.pos.z) },
+    rotY: Number(hard.rotY) || 0
+  };
+}
+
+  if (!hadSaved) {
+    const rng = makeRng(0x51ee7a + npcSpots.length * 97);
+
+    const throneAnchor = pickThroneAnchor();
+    const thronePlatform = pickThronePlatform(throneAnchor);
+
+    // Reserve throne platform for King + Knight only.
+    const nonThronePlatforms = thronePlatform
+      ? allowedPlatforms.filter((p) => p !== thronePlatform)
+      : allowedPlatforms.slice();
+
+    const placed: THREE.Vector3[] = [];
+
+    // King + Knight placement
+    if (thronePlatform) {
+      const hardKing = getHard(KING_ID);
+      const hardKnight = getHard(KNIGHT_ID);
+
+      // King tries to sit/stand centered on the throne anchor's XZ (if found).
+      let kingPos: THREE.Vector3 | null = null;
+      if (hardKing) {
+        kingPos = new THREE.Vector3(hardKing.pos.x, hardKing.pos.y, hardKing.pos.z);
+      }
+      if (!kingPos && throneAnchor) {
+        const h = raycastDownOn(thronePlatform.obj, throneAnchor.x, throneAnchor.z, thronePlatform.topY + 25);
+        if (h && isFlatHit(h)) {
+          kingPos = h.point.clone();
+        }
+      }
+      if (!kingPos) kingPos = samplePointOnPlatform(thronePlatform, rng) ?? thronePlatform.center.clone().setY(thronePlatform.topY);
+      placed.push(kingPos);
+      placementsObj[KING_ID] = hardKing
+        ? { pos: { x: kingPos.x, y: kingPos.y, z: kingPos.z }, rotY: Number(hardKing.rotY) || 0 }
+        : { pos: { x: kingPos.x, y: kingPos.y, z: kingPos.z }, rotY: Math.atan2(hubCenter.x - kingPos.x, hubCenter.z - kingPos.z) };
+
+      // Knight goes on the same throne room platform, but not on top of the king.
+      let knightPos: THREE.Vector3 | null = null;
+      if (hardKnight) {
+        knightPos = new THREE.Vector3(hardKnight.pos.x, hardKnight.pos.y, hardKnight.pos.z);
+      }
+      const offsets: [number, number][] = [
+        [2.8, 0],
+        [-2.8, 0],
+        [0, 2.8],
+        [0, -2.8],
+        [2.0, 2.0],
+        [-2.0, 2.0],
+        [2.0, -2.0],
+        [-2.0, -2.0]
+      ];
+      if (!knightPos) {
+        for (const [dx, dz] of offsets) {
+        const x = kingPos.x + dx;
+        const z = kingPos.z + dz;
+        const h = raycastDownOn(thronePlatform.obj, x, z, thronePlatform.topY + 25);
+        if (!h || !isFlatHit(h)) continue;
+        const p = h.point.clone();
+        if (!hasClearance(thronePlatform, p)) continue;
+        if (dist2(p, kingPos) < 2.2 * 2.2) continue;
+        knightPos = p;
+        break;
+      }
+      }
+      if (!knightPos) {
+        knightPos = samplePointOnPlatform(thronePlatform, rng);
+        if (knightPos && dist2(knightPos, kingPos) < 2.2 * 2.2) knightPos = null;
+      }
+      if (!knightPos) {
+        const fallback = thronePlatform.center.clone();
+        fallback.y = thronePlatform.topY;
+        fallback.x += 2.6;
+        knightPos = fallback;
+      }
+      placed.push(knightPos);
+      placementsObj[KNIGHT_ID] = hardKnight
+        ? { pos: { x: knightPos.x, y: knightPos.y, z: knightPos.z }, rotY: Number(hardKnight.rotY) || 0 }
+        : {
+            pos: { x: knightPos.x, y: knightPos.y, z: knightPos.z },
+            rotY: Math.atan2(hubCenter.x - knightPos.x, hubCenter.z - knightPos.z)
+          };
+    }
+
+    // Place everyone else on non-throne platforms.
+    for (const s of npcSpots) {
+      if (s.id === KING_ID || s.id === KNIGHT_ID) continue;
+
+      const hard = getHard(s.id);
+      if (hard) {
+        const hp = new THREE.Vector3(hard.pos.x, hard.pos.y, hard.pos.z);
+        placed.push(hp);
+        placementsObj[s.id] = { pos: { x: hp.x, y: hp.y, z: hp.z }, rotY: Number(hard.rotY) || 0 };
+        continue;
+      }
+
+      let p: THREE.Vector3 | null = null;
+      for (let tries = 0; tries < 240 && !p; tries++) {
+        const plat = weightedPick(nonThronePlatforms.length ? nonThronePlatforms : allowedPlatforms, rng);
+        const cand = samplePointOnPlatform(plat, rng);
+        if (!cand) continue;
+        if (tooClose(cand, placed)) continue;
+        // Avoid the hub spawn spot itself a bit.
+        if (dist2(cand, hubCenter) < 2.2 * 2.2) continue;
+        p = cand;
+      }
+
+      if (!p) {
+        // Fallback: put on hub in a small ring.
+        const angle = rng() * Math.PI * 2;
+        const r = 6 + rng() * 6;
+        p = new THREE.Vector3(hubCenter.x + Math.cos(angle) * r, hub.topY, hubCenter.z + Math.sin(angle) * r);
+      }
+
+      placed.push(p);
+      placementsObj[s.id] = {
+        pos: { x: p.x, y: p.y, z: p.z },
+        rotY: Math.atan2(hubCenter.x - p.x, hubCenter.z - p.z)
+      };
+    }
+
+    savePlacements();
+    console.info(`[SweetLand] Auto-generated NPC placements (saved to localStorage key: ${placementsKey}).`);
+    console.info(`[SweetLand] To download: run __sweetlandDownloadNpcPlacements() in the console.`);
+  }
+
+  // --- Spawn NPCs using placementsObj
+  console.log(`[SweetLand] Spawning ${npcSpots.length} NPCs (auto-distributed on candy island)...`);
+
+  for (let i = 0; i < npcSpots.length; i++) {
+    const s = npcSpots[i];
+    const entry = placementsObj[s.id];
+    const pos = entry
+      ? new THREE.Vector3(entry.pos.x, entry.pos.y, entry.pos.z)
+      : new THREE.Vector3(hubCenter.x, hub.topY, hubCenter.z);
+
+    const g = new THREE.Group();
+    g.name = s.id;
+    g.position.copy(pos);
+    // Face roughly toward hub center
+    g.rotation.y = entry ? entry.rotY : Math.atan2(hubCenter.x - pos.x, hubCenter.z - pos.z);
+
+    let mixer: THREE.AnimationMixer | undefined;
+    let clips: THREE.AnimationClip[] | undefined;
+    let actions: { idle?: THREE.AnimationAction; talk?: THREE.AnimationAction } | undefined;
+    let current: THREE.AnimationAction | null = null;
+
+    try {
+      if (s.model) {
+        const gltf = await loadGLTF(s.model);
+        const model = gltf.scene;
+        model.traverse((o) => {
+          if ((o as THREE.Mesh).isMesh) {
+            (o as THREE.Mesh).castShadow = true;
+            (o as THREE.Mesh).receiveShadow = true;
+          }
+        });
+
+        // Scale to a reasonable NPC height
+        const b = new THREE.Box3().setFromObject(model);
+        const sz = new THREE.Vector3();
+        b.getSize(sz);
+        const targetH = 2.2;
+        const sc = sz.y > 0 ? targetH / sz.y : 1;
+        model.scale.setScalar(sc);
+
+        // Center on feet
+        const b2 = new THREE.Box3().setFromObject(model);
+        const c = new THREE.Vector3();
+        b2.getCenter(c);
+        model.position.sub(new THREE.Vector3(c.x, b2.min.y, c.z));
+
+        g.add(model);
+
+        if (gltf.animations?.length) {
+          clips = gltf.animations;
+          mixer = new THREE.AnimationMixer(model);
+          const idleClip = gltf.animations.find((a) => /idle/i.test(a.name)) ?? gltf.animations[0];
+          const talkClip =
+            gltf.animations.find((a) => /wave|talk|greet|hello/i.test(a.name)) ??
+            gltf.animations.find((a) => /dance/i.test(a.name));
+
+          actions = {
+            idle: idleClip ? mixer.clipAction(idleClip) : undefined,
+            talk: talkClip ? mixer.clipAction(talkClip) : undefined,
+            walk: (clips ? clips.find((a) => /walk/i.test(a.name)) : undefined) ? mixer.clipAction(clips!.find((a) => /walk/i.test(a.name))!) : undefined,
+            run: (clips ? clips.find((a) => /run|jog|sprint/i.test(a.name)) : undefined) ? mixer.clipAction(clips!.find((a) => /run|jog|sprint/i.test(a.name))!) : undefined,
+            jump: (clips ? clips.find((a) => /jump|hop/i.test(a.name)) : undefined) ? mixer.clipAction(clips!.find((a) => /jump|hop/i.test(a.name))!) : undefined,
+            fall: (clips ? clips.find((a) => /fall|air|drop/i.test(a.name)) : undefined) ? mixer.clipAction(clips!.find((a) => /fall|air|drop/i.test(a.name))!) : undefined
+          };
+
+          if (actions.idle) {
+            actions.idle.play();
+            current = actions.idle;
+          }
+        }
+      }
+    } catch {
+      // fallback: simple capsule NPC
+      const body = new THREE.Mesh(
+        new THREE.CapsuleGeometry(0.35, 0.75, 8, 16),
+        new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.65 })
+      );
+      body.position.y = 0.9;
+      body.castShadow = true;
+
+      const head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.42, 20, 14),
+        new THREE.MeshStandardMaterial({
+          color: 0xff6cc1,
+          roughness: 0.55,
+          emissive: 0x190810,
+          emissiveIntensity: 0.25
+        })
+      );
+      head.position.y = 1.65;
+      head.castShadow = true;
+
+      g.add(body, head);
+    }
+
+    this.scene.add(g);
+
+    // Solid collider (capsule)
+    const npcBody = this.physics.world.createRigidBody(
+      this.physics.R.RigidBodyDesc.fixed().setTranslation(pos.x, pos.y, pos.z)
+    );
+    const npcSolidDesc = this.physics.R.ColliderDesc.capsule(0.65, 0.45)
+      .setTranslation(0, 1.05, 0)
+      .setFriction(1.0);
+    const solid = this.physics.world.createCollider(npcSolidDesc, npcBody);
+
+    // Sensor collider
+    const sensorDesc = this.physics.R.ColliderDesc.ball(1.35).setTranslation(pos.x, pos.y + 1.1, pos.z);
+    const sensor = this.physics.world.createCollider(sensorDesc);
+    sensor.setSensor(true);
+    sensor.setActiveEvents(this.physics.R.ActiveEvents.COLLISION_EVENTS | this.physics.R.ActiveEvents.INTERSECTION_EVENTS);
+    this.physics.tagCollider(sensor, { kind: "npc", id: s.id });
+
+    this.npcs.set(s.id, { group: g, body: npcBody, solid, sensor, name: s.name, baseY: pos.y, mixer, clips, actions, current });
+
+    onProgress?.(0.86 + 0.10 * ((i + 1) / npcSpots.length));
+  }
+
+  console.log(`[SweetLand] Spawned ${npcSpots.length} NPCs.`);
+  try {
+    (globalThis as any).__sweetlandNpcList = npcSpots as any[];
+    (globalThis as any).__sweetlandLevel = this;
+    const __n = Array.isArray((globalThis as any).__sweetlandNpcList)
+      ? (globalThis as any).__sweetlandNpcList.length
+      : 0;
+    console.info(`[SweetLand] Exposed ${__n} NPCs to globalThis.__sweetlandNpcList`);
+  } catch (e) {
+    console.warn("[SweetLand] Failed to expose NPC list", e);
+  }
+}
+
+
+
+
+  // ---------------------------------------------------------------------------
+  // NPC placement helpers (used by App.ts)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Spawn an NPC from an already-loaded THREE.Object3D (no GLTF path needed).
+   * Useful for "promoting" the current player model into an NPC.
+   */
+  spawnNpcFromVisual(
+    id: string,
+    name: string,
+    visual: THREE.Object3D,
+    pose: { x: number; y: number; z: number; rotY: number }
+  ): void {
+    if (!id) return;
+    if (this.npcs.has(id)) {
+      // If it already exists, just move it and ignore the passed visual.
+      this.setNpcPose(id, pose);
+      return;
+    }
+
+    const pos = new THREE.Vector3(pose.x, pose.y, pose.z);
+
+    const g = new THREE.Group();
+    g.name = id;
+    g.position.copy(pos);
+    g.rotation.y = Number(pose.rotY) || 0;
+
+    // Try to normalize the visual so it sits on its feet at y=0, centered on x/z.
+    try {
+      visual.traverse((o) => {
+        if ((o as THREE.Mesh).isMesh) {
+          (o as THREE.Mesh).castShadow = true;
+          (o as THREE.Mesh).receiveShadow = true;
+        }
+      });
+
+      const b2 = new THREE.Box3().setFromObject(visual);
+      const c = new THREE.Vector3();
+      b2.getCenter(c);
+      visual.position.sub(new THREE.Vector3(c.x, b2.min.y, c.z));
+
+      g.add(visual);
+    } catch {
+      // fallback: simple capsule NPC visual
+      const body = new THREE.Mesh(
+        new THREE.CapsuleGeometry(0.35, 0.75, 8, 16),
+        new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.65 })
+      );
+      body.position.y = 0.9;
+      body.castShadow = true;
+      const head = new THREE.Mesh(
+        new THREE.SphereGeometry(0.42, 20, 14),
+        new THREE.MeshStandardMaterial({ color: 0xff6cc1, roughness: 0.55, emissive: 0x190810, emissiveIntensity: 0.25 })
+      );
+      head.position.y = 1.65;
+      head.castShadow = true;
+      g.add(body, head);
+    }
+
+    this.scene.add(g);
+
+    // Solid collider (capsule) + fixed rigid body
+    const bodyRB = this.physics.world.createRigidBody(
+      this.physics.R.RigidBodyDesc.fixed().setTranslation(pos.x, pos.y, pos.z)
+    );
+    const solidDesc = this.physics.R.ColliderDesc.capsule(0.65, 0.45).setTranslation(0, 1.05, 0).setFriction(1.0);
+    const solid = this.physics.world.createCollider(solidDesc, bodyRB);
+
+    // Sensor collider
+    const sensorDesc = this.physics.R.ColliderDesc.ball(1.35).setTranslation(pos.x, pos.y + 1.1, pos.z);
+    const sensor = this.physics.world.createCollider(sensorDesc);
+    sensor.setSensor(true);
+    sensor.setActiveEvents(this.physics.R.ActiveEvents.COLLISION_EVENTS | this.physics.R.ActiveEvents.INTERSECTION_EVENTS);
+    this.physics.tagCollider(sensor, { kind: "npc", id });
+
+    this.npcs.set(id, { group: g, body: bodyRB, solid, sensor, name, baseY: pos.y });
+  }
+
+  /**
+   * Move an existing NPC (updates group + rigid body + sensor).
+   * The `y` value is the spawn/platform Y (same as `mesh.y` in your helper output).
+   */
+  setNpcPose(id: string, pose: { x: number; y: number; z: number; rotY: number }): boolean {
+    const npc = this.npcs.get(id);
+    if (!npc) return false;
+
+    const x = Number(pose.x);
+    const y = Number(pose.y);
+    const z = Number(pose.z);
+    const rotY = Number(pose.rotY) || 0;
+
+    npc.group.position.set(x, y, z);
+    npc.group.rotation.y = rotY;
+    npc.baseY = y;
+
+    try {
+      npc.body?.setTranslation({ x, y, z }, true);
+    } catch {}
+
+    try {
+      npc.sensor?.setTranslation({ x, y: y + 1.1, z });
+    } catch {}
+
+    return true;
+  }
+
+  /**
+   * Remove an NPC (group + colliders) cleanly.
+   */
+  removeNpc(id: string): boolean {
+    const npc = this.npcs.get(id);
+    if (!npc) return false;
+
+    try {
+      this.scene.remove(npc.group);
+    } catch {}
+
+    try {
+      this.physics.untagCollider(npc.sensor);
+    } catch {}
+
+    try {
+      this.physics.world.removeCollider(npc.sensor, true);
+    } catch {}
+
+    // Removing the rigid body removes the solid collider attached to it.
+    try {
+      this.physics.world.removeRigidBody(npc.body);
+    } catch {
+      try {
+        // fallback (in case removeRigidBody isn't available)
+        this.physics.world.removeCollider(npc.solid, true);
+      } catch {}
+    }
+
+    this.npcs.delete(id);
+    return true;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Compatibility: App.ts calls level.applyNpcPlacements(...)
+  // ---------------------------------------------------------------------------
+  applyNpcPlacements(placements: any) {
+    if (!placements) return;
+
+    // Expected shape:
+    //   { [id]: { pos:{x,y,z}, rotY:number } }
+    // but we also accept { [id]: { x,y,z, rotY } }.
+    for (const [id, v] of Object.entries(placements)) {
+      const anyV: any = v as any;
+      const pos = anyV?.pos ?? anyV?.spawn ?? anyV;
+      if (!pos) continue;
+
+      const x = Number(pos.x);
+      const y = Number(pos.y);
+      const z = Number(pos.z);
+      if (!isFinite(x) || !isFinite(y) || !isFinite(z)) continue;
+
+      const rotY = Number(anyV?.rotY ?? pos.rotY ?? 0) || 0;
+      this.setNpcPose(id, { x, y, z, rotY });
+    }
+  }
+
+
+
+  // --- JELLO GAP BRIDGE (2 slabs / 3 jumps total) ---
+  // Reads endpoints saved in localStorage by App.ts (Shift+1/Shift+2) and spawns 2 mid-air waffle slabs.
+  private addJelloGapBridge2Slabs(world: THREE.Object3D): void {
+    let startRaw: string | null = null;
+    let endRaw: string | null = null;
+    try {
+      startRaw = window.localStorage.getItem("sweetland:jelloBridgeStart");
+      endRaw = window.localStorage.getItem("sweetland:jelloBridgeEnd");
+    } catch {
+      return;
+    }
+    if (!startRaw || !endRaw) return;
+
+    let startObj: any, endObj: any;
+    try {
+      startObj = JSON.parse(startRaw);
+      endObj = JSON.parse(endRaw);
+    } catch {
+      return;
+    }
+
+    const start = new THREE.Vector3(+startObj.x, +startObj.y, +startObj.z);
+    const end = new THREE.Vector3(+endObj.x, +endObj.y, +endObj.z);
+
+    // Find a waffle slab template near the start or end
+    const template = this.findNearestWaffleTemplate(world, start) || this.findNearestWaffleTemplate(world, end);
+    if (!template) {
+      console.warn("[SweetLand] Jello bridge: no waffle slab template found near endpoints.");
+      return;
+    }
+
+    // Compute template's world bbox and center to preserve pivot offset
+    const tplBox = new THREE.Box3().setFromObject(template);
+    const tplCenter = tplBox.getCenter(new THREE.Vector3());
+    const originOffset = template.position.clone().sub(tplCenter);
+    const topDelta = tplBox.max.y - tplCenter.y;
+
+    // Keep top surface at START height (player feet)
+    const desiredTopY = start.y;
+    const desiredCenterY = desiredTopY - topDelta + 0.02;
+
+    const p1 = start.clone().lerp(end, 1 / 3);
+    const p2 = start.clone().lerp(end, 2 / 3);
+    p1.y = desiredCenterY;
+    p2.y = desiredCenterY;
+
+    this.spawnBridgeSlabClone(world, template, "Bridge_Jello_SlabA", p1, originOffset);
+    this.spawnBridgeSlabClone(world, template, "Bridge_Jello_SlabB", p2, originOffset);
+
+    // eslint-disable-next-line no-console
+    console.log("[SweetLand] Jello bridge: spawned 2 waffle slabs.", {
+      start: { x: start.x, y: start.y, z: start.z },
+      end: { x: end.x, y: end.y, z: end.z },
+    });
+  }
+
+  private spawnBridgeSlabClone(
+    world: THREE.Object3D,
+    template: THREE.Object3D,
+    name: string,
+    centerPos: THREE.Vector3,
+    originOffset: THREE.Vector3
+  ): void {
+    const existing = world.getObjectByName(name);
+    if (existing) {
+      existing.position.copy(centerPos.clone().add(originOffset));
+      return;
+    }
+
+    const slab = template.clone(true);
+    slab.name = name;
+    slab.position.copy(centerPos.clone().add(originOffset));
+    slab.quaternion.copy(template.quaternion);
+    slab.scale.copy(template.scale);
+
+    slab.traverse((o: any) => {
+      if (o && o.isMesh) {
+        o.castShadow = true;
+        o.receiveShadow = true;
+        // Ensure WALK_RE classifies it as walkable (contains "bridge")
+        o.name = name;
+      }
+    });
+
+    world.add(slab);
+  }
+
+  private findNearestWaffleTemplate(root: THREE.Object3D, target: THREE.Vector3): THREE.Object3D | null {
+    const box = new THREE.Box3();
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+
+    let best: THREE.Object3D | null = null;
+    let bestD = Infinity;
+
+    root.traverse((o: any) => {
+      if (!o || !o.isMesh) return;
+
+      const name = String(o.name || "").toLowerCase();
+      if (!(name.includes("waffle") || name.includes("platform_waffle") || name.includes("wafer"))) return;
+      if (name.includes("jumpbridge_slab")) return;
+
+      box.setFromObject(o);
+      box.getSize(size);
+      if (!isFinite(size.x) || !isFinite(size.y) || !isFinite(size.z)) return;
+      if (size.x < 0.75 || size.z < 0.75) return;
+      if (size.y > 1.75) return;
+
+      box.getCenter(center);
+      const d = center.distanceTo(target);
+      if (d < bestD) {
+        bestD = d;
+        best = o;
+      }
+    });
+
+    return best;
+  }
+
+}

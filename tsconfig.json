@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "types": [
+      "vite/client"
+    ],
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "isolatedModules": true,
+    "noUncheckedIndexedAccess": true
+  },
+  "include": [
+    "src"
+  ],
+  "exclude": [
+    "**/*.backup*.ts",
+    "**/*.bak*.ts",
+    "**/*backup*.ts",
+    "**/*_backup*.ts",
+    "**/*.BAK*.ts",
+    "**/*.ts.BAK*",
+    "**/*.ts.bak*"
+  ]
+}
