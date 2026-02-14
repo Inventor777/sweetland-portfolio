@@ -301,7 +301,7 @@ const SWEETLAND_NPC_DIALOGUE_BY_NPC_NAME: Record<string, string[]> = {
   "Marshie 01": ["You're on the right path! You've already passed the Projects portal when you spawned, and Collabs portal is coming up soon. Say hi to the Candy King for me if you see him around!"],
   "Sweetie 02": ["Did you know nobody's managed to collect all the collectibles yet? You just might be the first! Anyway, Chloe really wanted to be known as absurd in the second grade. I wonder if she still is..."],
   "EyeBud 03": ["Chloe had three pet snails when she was little. I remember her singing goodnight to us and I woke up here the very next day! I'm trying to find my siblings but I'm going as fast as I can. Say hello for me if you see them!"],
-  "Sweetbloom 03": ["Not many people stop and talk to a plant! Says a lot about your kind heart that you did. Chloe makes sure we get watered daily and promised us she'd bring back a lot more plants when she's back from her next adventure!"],
+  "Sweetbloom 03": ["PASTE YOUR NEW SWEETBLOOM LINE HERE (single line)"],
   "GummiBear 01": ["Want to explore more, do you? Chloe's Candy Castle is her homebase here in the Chloeverse, and she has plans to expand! But right now, there's not much else out there. You're more than welcome to wander about if you wish, but there's so much more of the Castle to see!"],
   "Candy King": ["Hi, nice to meet ya! I'm actually Chloe's brother, but don't let the crown and scepter fool you. She put me on admin duty while she's off adventuring in new lands and going on top secret quests. She said something about being 'the first born' and how I'm supposed to be 'responsible...' As soon as she's back, it's vacation time! Oh yeah before I forget, she'd probably want me to tell you to check out all four portals and explore all of her work!"],
   "Marshie 02": ["I hope Chloe returns soon! She promised to bring back a whole bed made of cotton candy for me. By the way, if you ever bring her spicy rice cakes or Tteokbokki, she'll probably be your best friend."],
@@ -378,7 +378,7 @@ const SWEETLAND_NPC_SCRIPTS_RAW: Array<{ from: string; to: string; lines: string
     "from": "Sweetbloom 03",
     "to": "Sweetbloom",
     "lines": [
-      "Not many people stop and talk to a plant! Says a lot about your kind heart that you did. Chloe makes sure we get watered daily and promised us she'd bring back a lot more plants when she's back from her next adventure!"
+      "Not many people stop and talk to a plant! Says a lot about your kind heart that you did. Here's a tip: If you press shift to run and jump, you'll be able to make it onto the waffle slab!"
     ]
   },
   {
@@ -931,8 +931,8 @@ this.scene.add(this.player.mesh);
       (e) => {
         if (e.repeat) return;
 
-        // Unstuck / warp to hub
-        if (e.code === "KeyU") this.warpToHub();
+        // respawn / warp to hub
+        if (e.code === "KeyR") this.warpToHub();
 
         // Reset coins
         if (e.code === "KeyR") this.resetCoins();
@@ -940,8 +940,46 @@ this.scene.add(this.player.mesh);
 
         // Music mute toggle
         if (e.code === "KeyM") {
-          try { this.audio.toggleMusicMute(); } catch {}
+          e.preventDefault();
+
+          const a: any = this.audio;
+
+          // Prefer music-only toggle (BGM). Fallback to global mute only if needed.
+          const muted =
+            typeof a?.toggleMusicMute === "function"
+              ? a.toggleMusicMute()
+              : typeof a?.toggleMute === "function"
+                ? a.toggleMute()
+                : null;
+
+          console.log("[SweetLand] Music toggle:", muted ? "MUTED" : "UNMUTED");
         }
+
+        // SWEETLAND_SFX_ENABLE_ALL_V3: universal SFX wiring + test hotkeys
+        // Space -> jump SFX (does not block gameplay)
+        if (!e.repeat && e.code === "Space") {
+          try { (this.audio as any).playSfx?.("jump"); } catch {}
+        }
+
+        // ALT+number keys -> quick SFX test palette (non-invasive)
+        if (e.altKey && !e.repeat) {
+          const a: any = this.audio;
+          const play = (k: string) => { try { a.playSfx?.(k); console.log("[SweetLand] SFX test:", k); } catch {} };
+          switch (e.code) {
+            case "Digit1": play("coin"); break;
+            case "Digit2": play("pickup"); break;
+            case "Digit3": play("portal_in"); break;
+            case "Digit4": play("portal_out"); break;
+            case "Digit5": play("jump"); break;
+            case "Digit6": play("jump_spring"); break;
+            case "Digit7": play("marshie_hi"); break;
+            case "Digit8": play("grummy_step"); break;
+            case "Digit9": play("sweetbloom_idle_loop"); break;
+            case "Digit0": play("music_sting"); break;
+          }
+        }
+
+
 // Save / clear the second waffle slab position (for JumpBridge_Slab02)
 // - Stand where you want the slab (midpoint between platforms), then press Shift+J
 // - Reload to see it. Press Shift+K to clear.
@@ -1140,7 +1178,7 @@ if (e.code === "KeyK" && e.shiftKey) {
     const { dx, dy } = this.input.consumeMouseDelta();
     if (dx || dy) this.tpc.updateFromMouse(dx, dy);
 
-    // Auto-unstuck if falling forever
+    // Auto-respawn if falling forever
     if (this.player.position.y < -55) this.warpToHub();
 
     // Fixed-step physics for stability
@@ -2254,8 +2292,11 @@ private render(): void {
   }
 
   private warpToHub(): void {
-    this.player.setPosition(this.level.spawn);
-  }
+    // Patched: custom hub/respawn destination (body coords)
+    this.player.setPosition(new THREE.Vector3(-33.7, 6.921, 22.758));
+    // Optional facing
+    if ((this.player as any).setRotationY) (this.player as any).setRotationY(1.939);
+}
 
   private resetCoins(): void {
     this.coins = 0;
@@ -2601,7 +2642,7 @@ private playPopSound(): void {
     osc.frequency.exponentialRampToValueAtTime(240, t0 + 0.08);
 
     gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(0.12, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.096, t0 + 0.01); // [SweetLand] volume scaled 0.8 pop
     gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.12);
 
     osc.connect(gain);

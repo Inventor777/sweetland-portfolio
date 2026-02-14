@@ -1,0 +1,10 @@
+
+# SweetLand local backups / patch artifacts
+**/*.bak
+**/*.bak_*
+**/*.BAK
+**/*.backup_*
+**/*backup_before_*
+**/*backup_*
+**/*_patch*/
+**/*_patch*.zip

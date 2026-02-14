@@ -183,8 +183,8 @@ export class App {
       (e) => {
         if (e.repeat) return;
 
-        // Unstuck / warp to hub
-        if (e.code === "KeyU") this.warpToHub();
+        // respawn / warp to hub
+        if (e.code === "KeyR") this.warpToHub();
 
         // Reset coins
         if (e.code === "KeyR") this.resetCoins();
@@ -339,7 +339,7 @@ export class App {
     const { dx, dy } = this.input.consumeMouseDelta();
     if (dx || dy) this.tpc.updateFromMouse(dx, dy);
 
-    // Auto-unstuck if falling forever
+    // Auto-respawn if falling forever
     if (this.player.position.y < -55) this.warpToHub();
 
     // Fixed-step physics for stability

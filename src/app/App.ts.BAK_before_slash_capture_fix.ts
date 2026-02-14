@@ -409,7 +409,7 @@ export class App {
       const __c = (e.code || "");
       if (__k === "c" || __c === "KeyC") { e.preventDefault(); e.stopPropagation(); __slPilotToggleV4(); return; }
       if (__k === "g" || __c === "KeyG") { e.preventDefault(); e.stopPropagation(); __slSavePlacementV4(); return; }
-      if (__k === "m" || __c === "KeyM") { e.preventDefault(); e.stopPropagation(); __slSetMainCharacterV4(); return; }
+      if (__k === "m" || __c === "KeyM") { /* M reserved for music (disabled character swap hotkey) */ }
     } catch (_) {}
 
           if (e.repeat) return;
@@ -434,8 +434,8 @@ export class App {
         // While placing, ignore other one-off interaction keys.
       }
 
-      // Unstuck / warp to hub
-      if (e.code === "KeyU") this.warpToHub();
+      // Respawn / warp to hub
+      if (e.code === "KeyR") this.warpToHub();
 
       // Reset coins
       if (e.code === "KeyR") this.resetCoins();
@@ -588,7 +588,7 @@ export class App {
     const { dx, dy } = this.input.consumeMouseDelta();
     if (dx || dy) this.tpc.updateFromMouse(dx, dy);
 
-    // Auto-unstuck if falling forever
+    // Auto-respawn if falling forever
     if (this.player.position.y < -55) this.warpToHub();
 
     // Fixed-step physics for stability

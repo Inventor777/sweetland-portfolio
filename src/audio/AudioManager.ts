@@ -37,10 +37,10 @@ const MUSIC_STORAGE_KEY = "sweetland:musicMuted";
 // Exact filenames from the OST zip (no renaming required)
 const OST_WAV_BY_ZONE: Record<ZoneId, string> = {
   hub: "1. Wonderland - Sweet Land OST.wav",
-  village: "13. Candyvale - Sweet Land OST.wav",
+  village: "3. Enchant - Sweet Land OST.wav",
   river: "9. Sweet Paradise - Sweet Land OST.wav",
   outskirts: "10. Melanchoney - Sweet Land OST.wav",
-  portals: "4. Sugarsteps - Sweet Land OST.wav",
+  portals: "2. Fairyland - Sweet Land OST.wav",
   portal_approach: "11. Spright - Sweet Land OST.wav",
 };
 
@@ -52,12 +52,37 @@ const OST_WAV_BY_PORTAL: Partial<Record<PortfolioSectionId, string>> = {
 };
 
 const SFX_URLS: Record<string, string> = {
-  coin: "/audio/sfx/sounds/PickUpItems/Coin.wav",
-  pickup: "/audio/sfx/sounds/PickUpItems/Pick_up.wav",
-  portal_in: "/audio/sfx/sounds/Teleport/Portal_in.wav",
-  portal_out: "/audio/sfx/sounds/Teleport/Portal_out.wav",
-};
+  // Pickups
+  coin: "/audio/sfx/PickUpItems/Coin.wav",
+  pickup: "/audio/sfx/PickUpItems/Pick_up.wav",
 
+  // Portals
+  portal_in: "/audio/sfx/Teleport/Portal_in.wav",
+  portal_out: "/audio/sfx/Teleport/Portal_out.wav",
+
+  // Jumps / trampoline
+  jump: "/audio/sfx/All_jump.wav",
+  jump_spring: "/audio/sfx/Batut/All_jump_spring.wav",
+
+  // NPC / ambient character loops (available; wiring optional)
+  grummy_step: "/audio/sfx/Grummy/Grummy_Step.wav",
+  grummy_run: "/audio/sfx/Grummy/Grummy_Run.wav",
+  grummy_dance: "/audio/sfx/Grummy/Grummy_Dance.wav",
+  grummy_dance_loop: "/audio/sfx/Grummy/Grummy_Dance_loop.wav",
+
+  marshie_hi: "/audio/sfx/Marshie/Marshies_Hi.wav",
+  marshie_step1: "/audio/sfx/Marshie/Marshies_Step1.wav",
+  marshie_step2: "/audio/sfx/Marshie/Marshies_Step2.wav",
+  marshie_step3: "/audio/sfx/Marshie/Marshies_Step3.wav",
+  marshie_step4: "/audio/sfx/Marshie/Marshies_Step4.wav",
+  marshie_dance: "/audio/sfx/Marshie/Marshies_Dance.wav",
+  marshie_dance_loop: "/audio/sfx/Marshie/Marshies_dance_loop.wav",
+
+  sweetbloom_idle_loop: "/audio/sfx/SweetBloom/Sweetbloom_idle_loop.wav",
+
+  // Misc (file exists; keep as a key in case you want it later)
+  music_sting: "/audio/sfx/music/music.wav",
+};
 function ostUrl(file: string): string {
   return encodeURI("/audio/ost/" + file);
 }
@@ -76,8 +101,8 @@ export class AudioManager {
 
   private lastPos = { x: 0, y: 0, z: 0 };
 
-  private readonly baseMusicVol = 0.2275;
-  private readonly sfxVol = 0.65;
+  private readonly baseMusicVol = 0.182; // [SweetLand] volume scaled 0.8
+  private readonly sfxVol = 0.52; // [SweetLand] volume scaled 0.8
 
   private a: HTMLAudioElement;
   private b: HTMLAudioElement;
@@ -386,4 +411,32 @@ export class AudioManager {
       // ignore
     }
   }
+  // SWEETLAND_AUDIO_MUTE_V1: global mute toggle (BGM + SFX)
+  private __slMuted = false;
+
+  public toggleMute(): boolean {
+    this.__slMuted = !this.__slMuted;
+    try {
+      // Prefer gain node if present
+      const g = (this as any).masterGain || (this as any).gain || (this as any).mainGain;
+      if (g && g.gain && typeof g.gain.value === "number") {
+        if (this.__slMuted) {
+          (this as any).__slPrevGain = g.gain.value;
+          g.gain.value = 0;
+        } else {
+          const prev = (this as any).__slPrevGain;
+          g.gain.value = (typeof prev === "number") ? prev : 1;
+        }
+      } else if ((this as any).ctx && typeof (this as any).ctx.suspend === "function") {
+        if (this.__slMuted) (this as any).ctx.suspend();
+        else (this as any).ctx.resume();
+      }
+    } catch {}
+    return this.__slMuted;
+  }
+
+  public get muted(): boolean {
+    return this.__slMuted;
+  }
+
 }

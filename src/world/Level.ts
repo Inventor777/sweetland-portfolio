@@ -101,7 +101,9 @@ export class Level {
   // Keep a handle to the loaded world scene for raycasts / placement.
   private worldRoot?: THREE.Object3D;
 
-  constructor(private physics: Physics) {}
+  constructor(private physics: Physics) {
+  this.installHoverPickNameDebug_v1();
+}
 
   get spawn(): THREE.Vector3 {
     return this._spawn.clone();
@@ -406,7 +408,6 @@ private findNearestWaffleSlab(
     });
 
     this.scene.add(world);
-
     this.addJelloGapBridge2Slabs(world);
     onProgress?.(0.45);
 
@@ -451,7 +452,6 @@ private findNearestWaffleSlab(
 // Use a broader ground mesh list (walkables + props) but exclude the decoration itself.
 const groundTargetsAll = [...walkables, ...props].filter((m) => !/(water|river|lake|ocean|sea|pond|pool)/i.test(this.fullLower(m)));
 this.forceGroundNamedDecorations(["Lollipop_01003", "TreeChocolate_01012"], groundTargetsAll);
-
 
 
     // Walkables: trimesh (accurate platforms/bridges)
@@ -1114,11 +1114,6 @@ const notWalkableLike = STRUCTURAL_RE.test(selfLower);
       node.updateMatrixWorld(true);
     }
   }
-
-
-
-
-
 
 
 private forceGroundNamedDecorations(namePartials: string[], groundMeshes: THREE.Mesh[]): void {
@@ -1914,7 +1909,8 @@ this.physics.world.createCollider(
 
       // Floating label (always)
       const label = this.makeFloatingLabel(sec.title);
-      label.position.set(0, 5.6, 0);
+      label.position.set(0, 5.35, -0.22); // embedded into arch (lower + slight back)
+      label.position.set(0, 5.45, -0.06);
       group.add(label);
 
       this.scene.add(group);
@@ -1934,32 +1930,110 @@ this.physics.world.createCollider(
     }
   }
 
-  private makeFloatingLabel(text: string): THREE.Mesh {
+  
+
+
+private makeFloatingLabel(text: string): THREE.Object3D {
+    // SWEETLAND_PORTAL_SIGN_STYLE_V22
+    // Restores the nicer "frosted plaque" look, while keeping dual-mesh readability (front + back).
+    const W = 640;
+    const H = 256;
+
     const canvas = document.createElement("canvas");
-    canvas.width = 512;
-    canvas.height = 256;
+    canvas.width = W;
+    canvas.height = H;
     const ctx = canvas.getContext("2d")!;
-    ctx.fillStyle = "rgba(18,24,33,0.78)";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.strokeStyle = "rgba(255,255,255,0.30)";
-    ctx.lineWidth = 8;
-    ctx.strokeRect(12, 12, canvas.width - 24, canvas.height - 24);
-    ctx.fillStyle = "white";
-    ctx.font = "900 72px system-ui, sans-serif";
+    ctx.clearRect(0, 0, W, H);
+
+    const rr = (x: number, y: number, w: number, h: number, r: number) => {
+      const rad = Math.max(0, Math.min(r, Math.min(w, h) * 0.5));
+      ctx.beginPath();
+      ctx.moveTo(x + rad, y);
+      ctx.arcTo(x + w, y, x + w, y + h, rad);
+      ctx.arcTo(x + w, y + h, x, y + h, rad);
+      ctx.arcTo(x, y + h, x, y, rad);
+      ctx.arcTo(x, y, x + w, y, rad);
+      ctx.closePath();
+    };
+
+    // Frosted background
+    const pad = 18;
+    const x = pad, y = pad, w = W - pad * 2, h = H - pad * 2;
+    rr(x, y, w, h, 34);
+    ctx.fillStyle = "rgba(42, 46, 58, 0.62)";
+    ctx.fill();
+
+    // Subtle top highlight (glass sheen)
+    const grad = ctx.createLinearGradient(0, y, 0, y + h);
+    grad.addColorStop(0, "rgba(255,255,255,0.14)");
+    grad.addColorStop(0.35, "rgba(255,255,255,0.03)");
+    grad.addColorStop(1, "rgba(255,255,255,0.00)");
+    rr(x + 6, y + 6, w - 12, h * 0.55, 28);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Border + faint inner glow
+    rr(x, y, w, h, 34);
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.stroke();
+
+    ctx.save();
+    ctx.shadowColor = "rgba(255,255,255,0.18)";
+    ctx.shadowBlur = 14;
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "rgba(255,255,255,0.10)";
+    rr(x + 6, y + 6, w - 12, h - 12, 28);
+    ctx.stroke();
+    ctx.restore();
+
+    // Text
+    ctx.save();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "800 112px system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+    ctx.shadowColor = "rgba(0,0,0,0.35)";
+    ctx.shadowBlur = 10;
+    ctx.shadowOffsetY = 4;
+    ctx.fillText(String(text ?? ""), W / 2, H / 2 + 2);
+    ctx.restore();
 
-    const tex = new THREE.CanvasTexture(canvas);
-    tex.colorSpace = THREE.SRGBColorSpace;
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    texture.anisotropy = 4;
 
-    const mesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(3.4, 1.7),
-      new THREE.MeshBasicMaterial({ map: tex, transparent: true })
-    );
-    mesh.rotation.y = Math.PI; // face camera-ish; camera can orbit so it's okay
-    return mesh;
+    const geometry = new THREE.PlaneGeometry(4.6, 1.9);
+    const material = new THREE.MeshBasicMaterial({
+      map: texture,
+      transparent: true,
+      side: THREE.FrontSide,
+      depthWrite: false,
+      depthTest: true
+    });
+
+    const group = new THREE.Group();
+
+    // Front-facing sign
+    const front = new THREE.Mesh(geometry, material);
+    (front as any).renderOrder = 9999;
+    group.add(front);
+
+    // Back-facing sign (duplicate mesh rotated 180°)
+    const back = new THREE.Mesh(geometry, material.clone());
+    (back as any).renderOrder = 9999;
+    back.rotation.y = Math.PI;
+    group.add(back);
+
+    group.traverse((o: any) => { o.frustumCulled = false; });
+
+    // Keep the prior scale tuning so the plaque sits nicely on the arch.
+    group.scale.setScalar(0.58);
+
+    return group;
   }
+
+
   private seedCoins(hub: PlatformCandidate, portalPlatforms: Record<string, PlatformCandidate>): void {
     // NOTE:
     // We intentionally do not spawn any procedural coin *rings* (hub/portal).
@@ -2594,8 +2668,6 @@ for (const s of npcSpots) {
 }
 
 
-
-
   // ---------------------------------------------------------------------------
   // NPC placement helpers (used by App.ts)
   // ---------------------------------------------------------------------------
@@ -2761,7 +2833,6 @@ for (const s of npcSpots) {
   }
 
 
-
   // --- JELLO GAP BRIDGE (2 slabs / 3 jumps total) ---
   // Reads endpoints saved in localStorage by App.ts (Shift+1/Shift+2) and spawns 2 mid-air waffle slabs.
   private addJelloGapBridge2Slabs(world: THREE.Object3D): void {
@@ -2892,4 +2963,436 @@ for (const s of npcSpots) {
     return best;
   }
 
+
+  // ---- SweetLand: snap specific props to ground (v1) ----
+  // marker: snapNamedPropsToGround_v1
+
+  // ---- SweetLand: Hover -> print name debug (v1) ----
+  // marker: installHoverPickNameDebug_v1
+  private __hoverPickNdc_v1: THREE.Vector2 | null = null;
+
+  
+  // ---- SweetLand: Hover -> print name debug (v1) ----
+  // marker: installHoverPickNameDebug_v1
+  private __hoverPickNdc_v1: THREE.Vector2 | null = null;
+
+  
+  // ---- SweetLand: Hover -> print name debug (v1) ----
+  // marker: installHoverPickNameDebug_v1
+  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
+
+  
+  // ---- SweetLand: Hover -> print name debug (v1) ----
+  // marker: installHoverPickNameDebug_v1
+  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
+
+  
+  // ---- SweetLand: Hover -> print name debug (v1) ----
+  // marker: installHoverPickNameDebug_v1
+  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
+
+  
+  // ---- SweetLand: Prop Identifier + Offset Tweaker (v24) ----
+  // marker: installHoverPickNameDebug_v1
+  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
+
+  
+  // ---- SweetLand: PropTweaker (v25) — Select by NAME + Offset Tweaks ----
+  // marker: installHoverPickNameDebug_v1
+  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
+
+  private installHoverPickNameDebug_v1(): void {
+    if ((this as any).__hoverPickInstalled_v1) return;
+    (this as any).__hoverPickInstalled_v1 = true;
+
+    const scene: any = (this as any).scene;
+    if (!scene) {
+      console.warn("[SweetLand] PropTweaker: scene not found.");
+      return;
+    }
+
+    const bTmp = new THREE.Box3();
+    const sTmp = new THREE.Vector3();
+    const cTmp = new THREE.Vector3();
+
+    const short = (s: string) => (s ? s.slice(0, 8) : "");
+
+    const buildPath = (obj: any): string => {
+      const parts: string[] = [];
+      let cur: any = obj;
+      for (let i = 0; i < 28 && cur; i++) {
+        const n = cur.name ? String(cur.name) : "(anon)";
+        parts.push(n);
+        cur = cur.parent;
+        if (!cur || cur === scene) break;
+      }
+      return parts.reverse().join(" / ");
+    };
+
+    const isRenderable = (o: any): boolean => !!(o && (o.isMesh || o.isSkinnedMesh));
+
+    const worldCenter = (o: any): THREE.Vector3 => {
+      try {
+        bTmp.setFromObject(o);
+        bTmp.getCenter(cTmp);
+        if (isFinite(cTmp.x) && isFinite(cTmp.y) && isFinite(cTmp.z)) return cTmp.clone();
+      } catch {}
+      try { return o.getWorldPosition(new THREE.Vector3()); } catch {}
+      return new THREE.Vector3();
+    };
+
+    const bboxSize = (o: any): THREE.Vector3 => {
+      try { bTmp.setFromObject(o); bTmp.getSize(sTmp); return sTmp.clone(); } catch {}
+      return new THREE.Vector3(0, 0, 0);
+    };
+
+    // -------- Visible Marker (sphere) --------
+    const clearMarker = () => {
+      try {
+        const old = (globalThis as any).__SweetLandPickMarker;
+        if (old && old.parent) old.parent.remove(old);
+      } catch {}
+      (globalThis as any).__SweetLandPickMarker = null;
+    };
+
+    const ensureMarker = (): THREE.Mesh => {
+      let m: any = (globalThis as any).__SweetLandPickMarker;
+      if (m && m.isMesh) return m;
+
+      const geo = new THREE.SphereGeometry(0.45, 16, 12);
+      const mat: any = new THREE.MeshBasicMaterial({ color: 0xffff00, transparent: true, opacity: 0.85 });
+      mat.depthTest = false;
+      const mesh: any = new THREE.Mesh(geo, mat);
+      mesh.renderOrder = 9999;
+      (globalThis as any).__SweetLandPickMarker = mesh;
+      scene.add(mesh);
+      return mesh;
+    };
+
+    const markAt = (pos: THREE.Vector3, scale = 1.0) => {
+      const m = ensureMarker();
+      m.position.copy(pos);
+      m.scale.setScalar(scale);
+    };
+
+    const markObj = (obj: any) => {
+      const p = worldCenter(obj);
+      const sz = bboxSize(obj);
+      const s = Math.max(0.6, Math.min(2.8, 0.2 * (sz.x + sz.y + sz.z)));
+      markAt(p, s);
+    };
+
+    // -------- Offset store (persistent) --------
+    const LS_KEY = "sweetland_prop_offsets_v1";
+
+    // Hardcoded ground-snap offsets (requested)
+    // NOTE: These are ALWAYS applied, even if localStorage is cleared.
+    const DEFAULT_OFFSETS: Record<string, number> = {
+      "Lollipop_01003": -0.21,
+      "TreeChocolate_01035": -1.46
+    };
+
+
+    const loadOffsets = (): Record<string, number> => {
+      // Merge hardcoded defaults with any saved overrides
+      const base: Record<string, number> = { ...DEFAULT_OFFSETS };
+      try {
+        const raw = window.localStorage.getItem(LS_KEY);
+        if (!raw) return base;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return base;
+        // Only merge numeric entries
+        for (const k of Object.keys(parsed)) {
+          const v = (parsed as any)[k];
+          if (typeof v === "number" && isFinite(v)) base[k] = v;
+        }
+        return base;
+      } catch { return base; }
+    };
+
+    const saveOffsets = (m: Record<string, number>) => {
+      try { window.localStorage.setItem(LS_KEY, JSON.stringify(m)); } catch {}
+    };
+
+    const getKeyFor = (obj: any): string => {
+      const nm = obj?.name ? String(obj.name) : "";
+      if (nm) return nm;
+      return buildPath(obj);
+    };
+
+    const applyOffsetsOnce = () => {
+      const offsets = loadOffsets();
+      let applied = 0;
+      scene.traverse((o: any) => {
+        if (!o || !o.position) return;
+                const key = getKeyFor(o);
+        // SweetLand Patch v34: honor duplicate-safe keys like "Tree_02001#1a2b3c4d"
+        const nm = (o && o.name ? String(o.name) : "");
+        const uuid8 = (o && o.uuid ? String(o.uuid).slice(0, 8) : "");
+        const keyUuid = (nm && uuid8) ? (nm + "#" + uuid8) : "";
+        const off = (typeof offsets[key] === "number")
+          ? offsets[key]
+          : (keyUuid && typeof offsets[keyUuid] === "number")
+            ? offsets[keyUuid]
+            : undefined;
+        if (typeof off !== "number") return;
+
+        if (o.userData && typeof o.userData.__slBaseY !== "number") {
+          o.userData.__slBaseY = o.position.y;
+        }
+        const baseY = (o.userData && typeof o.userData.__slBaseY === "number") ? o.userData.__slBaseY : o.position.y;
+        o.position.y = baseY + off;
+        applied++;
+      });
+      if (applied) console.log("[SweetLand] PropTweaker: applied", applied, "saved offsets from", LS_KEY);
+    };
+
+    applyOffsetsOnce();
+
+    // SweetLand v31-fixed3: re-apply after late world transforms
+    window.setTimeout(applyOffsetsOnce, 0);
+    window.setTimeout(applyOffsetsOnce, 250);
+    window.setTimeout(applyOffsetsOnce, 1500);
+
+
+    // -------- Selection + public helpers --------
+    const setSelected = (obj: any) => {
+      (globalThis as any).__SweetLandSelectedProp = obj;
+      (globalThis as any).__SweetLandSelectedKey = getKeyFor(obj);
+      markObj(obj);
+      console.log('[SweetLand] PropTweaker SELECTED key="' + (globalThis as any).__SweetLandSelectedKey + '" path="' + buildPath(obj) + '"', obj);
+      return obj;
+    };
+
+    const selectPropByName = (query: string) => {
+      const q = String(query || "").trim();
+      if (!q) { console.warn("[SweetLand] __SweetLandSelectProp: empty query"); return null; }
+
+      const exact: any[] = [];
+      const partial: any[] = [];
+      const qLower = q.toLowerCase();
+
+      scene.traverse((o: any) => {
+        if (!isRenderable(o)) return;
+        const nm = o?.name ? String(o.name) : "";
+        if (!nm) return;
+
+        const nLower = nm.toLowerCase();
+        if (nLower === qLower) exact.push(o);
+        else if (nLower.includes(qLower)) partial.push(o);
+      });
+
+      const list = exact.length ? exact : partial;
+      if (!list.length) {
+        console.warn('[SweetLand] __SweetLandSelectProp: no matches for "' + q + '". Try __SweetLandListProps("' + q + '")');
+        return null;
+      }
+
+      if (list.length > 1) {
+        console.log('[SweetLand] __SweetLandSelectProp: multiple matches (' + list.length + ') for "' + q + '", selecting first. Use __SweetLandListProps("' + q + '") to inspect.');
+      }
+
+      return setSelected(list[0]);
+    };
+
+    const listProps = (filter?: string, limit = 40) => {
+      const f = (filter ? String(filter) : "").toLowerCase();
+      const out: any[] = [];
+      scene.traverse((o: any) => {
+        if (!isRenderable(o)) return;
+        const nm = o?.name ? String(o.name) : "";
+        if (!nm) return;
+        const p = buildPath(o);
+        const row = { name: nm, type: o.type, path: p };
+        if (!f || nm.toLowerCase().includes(f) || p.toLowerCase().includes(f)) out.push(row);
+      });
+      out.sort((a,b) => a.name.localeCompare(b.name));
+      const sliced = out.slice(0, limit);
+      console.log('[SweetLand] __SweetLandListProps("' + (filter || "") + '") -> ' + out.length + " matches (showing " + sliced.length + ")");
+      sliced.forEach((r, i) => console.log("#" + (i+1), r.name, "path=", r.path));
+      return out;
+    };
+
+    (globalThis as any).__SweetLandSelectProp = selectPropByName;
+    (globalThis as any).__SweetLandListProps = listProps;
+
+    // --- SweetLand Patch v34: duplicates-safe selection helpers ---
+    const __uuidKey = (o: any): string => {
+      const nm = o?.name ? String(o.name) : "";
+      const u8 = o?.uuid ? String(o.uuid).slice(0, 8) : "";
+      return (nm && u8) ? (nm + "#" + u8) : nm;
+    };
+
+    const __getPlayerPos = (): THREE.Vector3 | null => {
+      try {
+        const p: any = (globalThis as any).__sweetlandPlayer || (globalThis as any).__SweetLandPlayer;
+        if (p && p.body && typeof p.body.translation === "function") {
+          const t = p.body.translation();
+          return new THREE.Vector3(t.x, t.y, t.z);
+        }
+      } catch {}
+      return null;
+    };
+
+    const __SweetLandFindProps = (query: string, limit = 80) => {
+      const q = String(query || "").toLowerCase().trim();
+      const out: any[] = [];
+      scene.traverse((o: any) => {
+        if (!isRenderable(o)) return;
+        const nm = o?.name ? String(o.name) : "";
+        const p = buildPath(o);
+        const hay = (nm + " " + p).toLowerCase();
+        if (q && hay.indexOf(q) === -1) return;
+
+        const pos = worldCenter(o);
+        out.push({
+          key: __uuidKey(o),
+          name: nm || "(no-name)",
+          uuid8: o?.uuid ? String(o.uuid).slice(0, 8) : "",
+          type: o?.type || "",
+          path: p,
+          pos,
+        });
+      });
+
+      const pp = __getPlayerPos();
+      if (pp) {
+        out.sort((a, b) => a.pos.distanceToSquared(pp) - b.pos.distanceToSquared(pp));
+      } else {
+        out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+      }
+
+      const sliced = out.slice(0, limit);
+      console.log('[SweetLand] __SweetLandFindProps("' + (query || "") + '") -> ' + out.length + " matches (showing " + sliced.length + ")");
+      sliced.forEach((r, i) => {
+        console.log(
+          "#" + i,
+          'key="' + r.key + '"',
+          "name=" + r.name,
+          "pos=(" + r.pos.x.toFixed(2) + "," + r.pos.y.toFixed(2) + "," + r.pos.z.toFixed(2) + ")",
+          'path="' + r.path + '"'
+        );
+      });
+      return out.map(r => ({
+        key: r.key,
+        name: r.name,
+        uuid8: r.uuid8,
+        type: r.type,
+        path: r.path,
+        pos: { x: +r.pos.x.toFixed(2), y: +r.pos.y.toFixed(2), z: +r.pos.z.toFixed(2) },
+      }));
+    };
+
+    const __SweetLandSelectKey = (key: string) => {
+      const k = String(key || "").trim();
+      if (!k) return null;
+
+      let found: any = null;
+      scene.traverse((o: any) => {
+        if (found) return;
+        if (!isRenderable(o)) return;
+        if (__uuidKey(o) === k) found = o;
+      });
+
+      if (!found) {
+        console.warn('[SweetLand] __SweetLandSelectKey: not found key="' + k + '". Try __SweetLandFindProps("Tree_02")');
+        return null;
+      }
+
+      (globalThis as any).__SweetLandSelectedProp = found;
+      (globalThis as any).__SweetLandSelectedKey = k; // force offsets to store under uuid-key
+      markObj(found);
+      console.log('[SweetLand] __SweetLandSelectKey SELECTED key="' + k + '" path="' + buildPath(found) + '"', found);
+      return found;
+    };
+
+    let __SweetLandCycleIndex = -1;
+    const __SweetLandCycleProp = (query: string) => {
+      const list = __SweetLandFindProps(query, 200);
+      if (!list.length) return null;
+      __SweetLandCycleIndex = (__SweetLandCycleIndex + 1) % list.length;
+      const chosen = list[__SweetLandCycleIndex];
+      console.log("[SweetLand] __SweetLandCycleProp picked #", __SweetLandCycleIndex, chosen.key, chosen.name);
+      return __SweetLandSelectKey(chosen.key);
+    };
+
+    (globalThis as any).__SweetLandFindProps = __SweetLandFindProps;
+    (globalThis as any).__SweetLandSelectKey = __SweetLandSelectKey;
+    (globalThis as any).__SweetLandCycleProp = __SweetLandCycleProp;
+
+    console.log("[SweetLand] SweetLand Patch v34 installed: __SweetLandFindProps / __SweetLandSelectKey / __SweetLandCycleProp");
+    // --- End v34 helpers ---
+
+
+    // -------- Nudge selected prop offset --------
+    const nudgeSelected = (delta: number) => {
+      const obj: any = (globalThis as any).__SweetLandSelectedProp;
+      const key: string = (globalThis as any).__SweetLandSelectedKey;
+      if (!obj || !key) {
+        console.warn("[SweetLand] PropTweaker: no selected prop. Run __SweetLandSelectProp('Lollipop_01003') first.");
+        return;
+      }
+
+      if (obj.userData && typeof obj.userData.__slBaseY !== "number") {
+        obj.userData.__slBaseY = obj.position.y;
+      }
+      const baseY = (obj.userData && typeof obj.userData.__slBaseY === "number") ? obj.userData.__slBaseY : obj.position.y;
+
+      const offsets = loadOffsets();
+      const cur = typeof offsets[key] === "number" ? offsets[key] : 0;
+      const next = cur + delta;
+      offsets[key] = next;
+      saveOffsets(offsets);
+
+      obj.position.y = baseY + next;
+      markObj(obj);
+      console.log('[SweetLand] PropTweaker offset updated: key="' + key + '" offset=' + next.toFixed(4) + " (delta=" + delta.toFixed(4) + ")");
+    };
+
+    const resetSelected = () => {
+      const obj: any = (globalThis as any).__SweetLandSelectedProp;
+      const key: string = (globalThis as any).__SweetLandSelectedKey;
+      if (!obj || !key) {
+        console.warn("[SweetLand] PropTweaker: no selected prop.");
+        return;
+      }
+      const offsets = loadOffsets();
+      delete offsets[key];
+      saveOffsets(offsets);
+
+      const baseY = (obj.userData && typeof obj.userData.__slBaseY === "number") ? obj.userData.__slBaseY : obj.position.y;
+      obj.position.y = baseY;
+      markObj(obj);
+      console.log('[SweetLand] PropTweaker RESET key="' + key + '" (offset cleared)');
+    };
+
+    const printOffsets = () => {
+      const offsets = loadOffsets();
+      console.log("[SweetLand] PropTweaker OFFSETS JSON (merged: DEFAULT_OFFSETS + localStorage '" + LS_KEY + "'):");
+      console.log(JSON.stringify(offsets, null, 2));
+      console.log("[SweetLand] Tip: To clear all offsets: localStorage.removeItem('" + LS_KEY + "') then reload.");
+    };
+
+    window.addEventListener("keydown", (ev: KeyboardEvent) => {
+      if (ev.code === "BracketLeft")  nudgeSelected(ev.shiftKey ? -0.05 : -0.01);
+      if (ev.code === "BracketRight") nudgeSelected(ev.shiftKey ?  0.05 :  0.01);
+      if (ev.code === "KeyR") resetSelected();
+      if (ev.code === "KeyO") printOffsets();
+      if (ev.code === "KeyH") clearMarker();
+    });
+
+    console.log("[SweetLand] PropTweaker v25 enabled (camera not required).");
+    console.log("  DevTools: __SweetLandSelectProp('Lollipop_01003') to select by name");
+    console.log("  DevTools: __SweetLandListProps('Lollipop') to browse names");
+    console.log("  [ / ] = nudge selected DOWN/UP (Shift = bigger step), R reset, O print offsets, H clear marker");
+  }
+
+
+
+
+
+
+
 }
+
+// SweetLand Patch v34

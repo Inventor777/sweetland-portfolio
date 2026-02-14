@@ -22,14 +22,14 @@ export const PORTFOLIO_SECTIONS: PortfolioSection[] = [
     title: "Work",
     description: "Experience, roles, and outcomes.",
     url: "https://example.com/work",
-    hotkey: "Digit2"
+    hotkey: "Digit3"
   },
   {
     id: "collabs",
     title: "Collabs",
     description: "UGC, partnerships, and creative collaborations.",
     url: "https://example.com/collabs",
-    hotkey: "Digit3"
+    hotkey: "Digit2"
   },
   {
     id: "contact",
