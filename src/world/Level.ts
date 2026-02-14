@@ -2969,37 +2969,31 @@ for (const s of npcSpots) {
 
   // ---- SweetLand: Hover -> print name debug (v1) ----
   // marker: installHoverPickNameDebug_v1
-  private __hoverPickNdc_v1: THREE.Vector2 | null = null;
+  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // [SweetLand] de-dupe __hoverPickNdc_v1 v2
 
   
   // ---- SweetLand: Hover -> print name debug (v1) ----
   // marker: installHoverPickNameDebug_v1
-  private __hoverPickNdc_v1: THREE.Vector2 | null = null;
 
   
   // ---- SweetLand: Hover -> print name debug (v1) ----
   // marker: installHoverPickNameDebug_v1
-  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
 
   
   // ---- SweetLand: Hover -> print name debug (v1) ----
   // marker: installHoverPickNameDebug_v1
-  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
 
   
   // ---- SweetLand: Hover -> print name debug (v1) ----
   // marker: installHoverPickNameDebug_v1
-  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
 
   
   // ---- SweetLand: Prop Identifier + Offset Tweaker (v24) ----
   // marker: installHoverPickNameDebug_v1
-  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
 
   
   // ---- SweetLand: PropTweaker (v25) — Select by NAME + Offset Tweaks ----
   // marker: installHoverPickNameDebug_v1
-  private __hoverPickNdc_v1: THREE.Vector2 | null = null; // kept for compatibility (unused)
 
   private installHoverPickNameDebug_v1(): void {
     if ((this as any).__hoverPickInstalled_v1) return;
