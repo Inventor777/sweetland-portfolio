@@ -1,7 +1,0 @@
-Patch v4 (ramps + baked pickups + wall safety + sky)
-
-- Fix: Gingerbread ramps were being misclassified as baked pickups; now walkable classification happens before baked-pickup detection.
-- Fix: Baked pickups now use their bounds-center (not pivot) for proximity pickup, and IDs are unique per mesh.
-- Fix: Large "structural" meshes no longer get overly-shrunk colliders; reduced seam holes.
-- Fix: Added a safety core collider to large trimesh walkables to prevent rare fall-through seams.
-- Visual: Sky background changed to blue with simple sprite-based clouds.

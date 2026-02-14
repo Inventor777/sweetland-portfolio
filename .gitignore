@@ -8,3 +8,25 @@
 **/*backup_*
 **/*_patch*/
 **/*_patch*.zip
+
+# SweetLand: repo cleanup v3
+# deps/build output
+node_modules/
+dist/
+.vite/
+# backups
+**/*.bak
+**/*.bak_*
+**/*.BAK
+**/*.backup_*
+**/*backup_before_*
+**/*backup_*
+_backup*/
+_backup_*/
+backup_patch*/
+# patch artifacts
+*_patch*/
+*_patch*.zip
+sweetland*.zip
+*.patch
+*.log
