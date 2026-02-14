@@ -30,3 +30,10 @@ backup_patch*/
 sweetland*.zip
 *.patch
 *.log
+
+# SweetLand: ignore before_* snapshots
+**/*.before_*.ts
+**/*.before_*.tsx
+**/*.before_*.js
+**/*.before_*.jsx
+**/*.before_*.json
