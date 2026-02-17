@@ -87,3 +87,11 @@ If you want, we can do this step together:
 When you’re ready, tell me:
 - which GLB you want as the playable avatar (filename),
 - and whether that GLB contains animations (idle/walk/run) — I’ll hook it up.
+
+
+## Cloudflare Pages asset limit
+
+Cloudflare Pages has a hard 25 MiB limit per deployed static asset.
+Host `Sweet_Land.glb` in R2 at `/models/Sweet_Land.glb`.
+Set `VITE_ASSET_BASE_URL` in Cloudflare Pages to your R2 public domain (example: `https://assets.imchloekang.com`).
+Optional for local dev: set the same value in `.env.local`.
