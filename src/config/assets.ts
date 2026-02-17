@@ -5,9 +5,11 @@
  * This repo already contains the Sweet Land pack under:
  *   public/models/Sweet_Land_glb/...
  */
+const ASSET_BASE = ((import.meta as any).env?.VITE_ASSET_BASE_URL || "https://assets.imchloekang.com").replace(/\/$/, "");
+
 export const ASSETS = {
   // Full assembled world:
-  world: "/models/Sweet_Land_glb/Sweet_Land.glb",
+  world: `${ASSET_BASE}/models/Sweet_Land.glb`,
 
   // Playable avatar (picked for “main character energy” + full move set):
   playerAvatar: "/models/Sweet_Land_glb/Separate_assets_glb/Sweetie_01.glb",
