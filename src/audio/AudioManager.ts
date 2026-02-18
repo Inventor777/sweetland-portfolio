@@ -49,7 +49,7 @@ const OST_WAV_BY_PORTAL: Partial<Record<PortfolioSectionId, string>> = {
   projects: "8. Whirl - Sweet Land OST.wav",
   work: "5. Jubilee - Sweet Land OST.wav",
   collabs: "7. Bubblebounce - Sweet Land OST.wav",
-  contact: "2. Fairyland - Sweet Land OST.wav",
+  contact: "12. Whimsy - Sweet Land OST.wav",
 };
 
 const SFX_URLS: Record<string, string> = {
