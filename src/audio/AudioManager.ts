@@ -33,6 +33,7 @@ function applyStartOffset(audio: HTMLAudioElement, key: string) {
 type ZoneId = "hub" | "village" | "river" | "outskirts" | "portals" | "portal_approach";
 
 const MUSIC_STORAGE_KEY = "sweetland:musicMuted";
+const MUSIC_CROSSFADE_MS = 250;
 
 // Exact filenames from the OST zip (no renaming required)
 const OST_WAV_BY_ZONE: Record<ZoneId, string> = {
@@ -112,6 +113,7 @@ export class AudioManager {
   private fade:
     | { from: HTMLAudioElement; to: HTMLAudioElement; startMs: number; durMs: number; targetVol: number }
     | null = null;
+  private trackSwitchId = 0;
 
   constructor() {
     try {
@@ -233,7 +235,7 @@ export class AudioManager {
 
   private makeMusicEl(): HTMLAudioElement {
     const el = new Audio();
-    el.preload = "none";
+    el.preload = "auto";
     el.loop = true;
     el.volume = 0;
     return el;
@@ -268,52 +270,73 @@ export class AudioManager {
 
   private setTrack(file: string, immediate = false): void {
     if (!file) return;
-    if (this.currentTrackFile === file && this.active.src) return;
+    if (this.currentTrackFile === file) return;
 
+    const switchId = ++this.trackSwitchId;
     this.currentTrackFile = file;
     const url = ostUrl(file);
 
-    if (immediate) {
-      try {
-        this.active.pause();
-      } catch {}
-      this.active.src = url;
-      // SWEETLAND_AUDIO_CANDYVALE_OFFSET_V1
-      this.safeSetTime(this.active, this.startOffsetForFile(file));
-      this.active.volume = this.musicMuted ? 0 : this.baseMusicVol;
-      this.safePlay(this.active);
-
-      try {
-        this.inactive.pause();
-        this.inactive.volume = 0;
-      } catch {}
-
-      this.fade = null;
-      return;
-    }
-
     const from = this.active;
     const to = this.inactive;
+    const targetVol = this.musicMuted ? 0 : this.baseMusicVol;
 
     try {
       to.pause();
+      to.currentTime = 0;
+      to.volume = 0;
     } catch {}
+
     to.src = url;
     // SWEETLAND_AUDIO_CANDYVALE_OFFSET_V1
     this.safeSetTime(to, this.startOffsetForFile(file));
-    to.volume = 0;
-    this.safePlay(to);
+    to.volume = immediate ? targetVol : 0;
+    try { to.load(); } catch {}
 
-    this.fade = {
-      from,
-      to,
-      startMs: performance.now(),
-      durMs: 900,
-      targetVol: this.musicMuted ? 0 : this.baseMusicVol,
+    this.runWhenPlayable(to, switchId, () => {
+      this.safePlay(to);
+
+      if (immediate) {
+        try {
+          from.pause();
+          from.currentTime = 0;
+          from.volume = 0;
+        } catch {}
+        to.volume = targetVol;
+        this.fade = null;
+      } else {
+        this.fade = {
+          from,
+          to,
+          startMs: performance.now(),
+          durMs: MUSIC_CROSSFADE_MS,
+          targetVol,
+        };
+      }
+
+      this.active = to;
+      this.inactive = from;
+    });
+  }
+
+  private runWhenPlayable(el: HTMLAudioElement, switchId: number, onReady: () => void): void {
+    const cleanup = () => {
+      try { el.removeEventListener("loadedmetadata", ready); } catch {}
+      try { el.removeEventListener("canplay", ready); } catch {}
     };
 
-    this.active = to;
-    this.inactive = from;
+    const ready = () => {
+      cleanup();
+      if (switchId !== this.trackSwitchId) return;
+      onReady();
+    };
+
+    if (el.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      ready();
+      return;
+    }
+
+    el.addEventListener("loadedmetadata", ready);
+    el.addEventListener("canplay", ready);
   }
 
   private stepFade(): void {
