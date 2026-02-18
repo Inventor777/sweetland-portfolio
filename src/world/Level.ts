@@ -562,8 +562,7 @@ const mn = (((m.material as any)?.name ?? "") as string).toLowerCase();
     // Analyze platforms to find hub + 4 nearby portal platforms
     const platformCandidates = this.findPlatformCandidates(world);
     const hub = this.pickHubPlatform(platformCandidates);
-    this._spawn = hub.center.clone();
-    this._spawn.y = hub.topY + 1.4;
+    this._spawn.set(-40.308, 6.86, 62.331);
 
     const portalPlatforms = this.pickPortalPlatforms(platformCandidates, hub);
 
