@@ -101,12 +101,16 @@
 
     <script type="module" src="/src/main.ts"></script>
   
+
 <script>
-// __sweetlandLoadingTipsV2
+// __sweetlandLoadingTipsV3_LIST
 document.addEventListener("DOMContentLoaded", () => {
   const loading = document.getElementById("loading");
   const tip = document.getElementById("loadingTip");
   if (!loading || !tip) return;
+
+  // Make sure the container can display multiple lines nicely even if CSS was single-line
+  tip.style.whiteSpace = "normal";
 
   const tips = [
     "Move: WASD",
@@ -118,7 +122,7 @@ document.addEventListener("DOMContentLoaded", () => {
     "Mute music: M",
   ];
 
-  let i = 0;
+  let idx = 0;
   let timer = null;
 
   const isVisible = () => {
@@ -133,12 +137,34 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
+  const addLine = () => {
+    if (idx >= tips.length) return;
+
+    const line = document.createElement("div");
+    line.className = "loading-tip-line";
+    line.style.marginTop = "6px";
+    line.textContent = tips[idx++];
+
+    tip.appendChild(line);
+
+    if (idx >= tips.length) stop(); // once all are shown, stop
+  };
+
   const start = () => {
     if (timer != null) return;
-    tip.textContent = tips[i++ % tips.length];
+
+    // If the list is already built, don't rebuild it.
+    // (This avoids duplicates if the overlay toggles.)
+    if (tip.childElementCount >= tips.length) return;
+
+    // Continue from however many lines already exist
+    idx = Math.min(tip.childElementCount, tips.length);
+
+    // Add immediately, then every 500ms
+    addLine();
     timer = setInterval(() => {
       if (!isVisible()) return stop();
-      tip.textContent = tips[i++ % tips.length];
+      addLine();
     }, 500);
   };
 
@@ -151,6 +177,5 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 });
 </script>
-
 </body>
 </html>
