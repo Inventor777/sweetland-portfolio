@@ -114,6 +114,8 @@ export class AudioManager {
     | { from: HTMLAudioElement; to: HTMLAudioElement; startMs: number; durMs: number; targetVol: number }
     | null = null;
   private trackSwitchId = 0;
+  private sfxPools: Record<string, HTMLAudioElement[]> = {};
+  private sfxPoolIndex: Record<string, number> = {};
 
   constructor() {
     try {
@@ -133,7 +135,7 @@ export class AudioManager {
   /** Call on the first user gesture (pointerdown) to allow autoplay. */
   onFirstGesture(): void {
     if (this.started) return;
-    this.started = true;
+    this.started = true; this.prewarmSfx();
 
     if (!this.musicMuted) {
       // Start with a safe default; zone selection takes over on update().
@@ -173,18 +175,71 @@ export class AudioManager {
 
   /** Play a SFX by key (safe no-op if missing). */
   playSfx(key: string): void {
-    const url = SFX_URLS[key];
+    const url = (SFX_URLS as any)[key];
     if (!url) return;
-
     try {
-      const el = new Audio(url);
-      el.preload = "auto";
-            // SWEETLAND_SFX_COLLECTIBLE_BOOST_V1
-      var mul = (key === "coin" || key === "pickup") ? 1.2 : 1.0;
-      el.volume = clamp01(this.sfxVol * mul);
-      el.loop = false;
-      if (typeof applyStartOffset === "function") applyStartOffset(el, key as any);
+      const mul = (key === "coin" || key === "pickup") ? 1.2 : 1.0;
+      const volume = clamp01(this.sfxVol * mul);
+      this.playFromPool(key, url, volume);
+    } catch {
+      // ignore
+    }
+  }
+
+  private sfxPoolSizeForKey(key: string): number {
+    return (key === "coin" || key === "pickup") ? 8 : 2;
+  }
+
+  private ensureSfxPool(key: string, url: string): HTMLAudioElement[] {
+    const existing = this.sfxPools[key];
+    if (existing && existing.length) return existing;
+
+    const n = this.sfxPoolSizeForKey(key);
+    const pool: HTMLAudioElement[] = [];
+    for (let i = 0; i < n; i++) {
+      try {
+        const el = new Audio(url);
+        el.preload = "auto";
+        el.loop = false;
+        el.volume = 0;
+        try { el.load(); } catch {}
+        pool.push(el);
+      } catch {}
+    }
+    this.sfxPools[key] = pool;
+    this.sfxPoolIndex[key] = 0;
+    return pool;
+  }
+
+  private playFromPool(key: string, url: string, volume: number): void {
+    try {
+      const pool = this.ensureSfxPool(key, url);
+      if (!pool || pool.length === 0) return;
+
+      const i0 = (this.sfxPoolIndex[key] ?? 0) % pool.length;
+      this.sfxPoolIndex[key] = i0 + 1;
+
+      const el = pool[i0];
+      try { el.pause(); } catch {}
+      try { el.currentTime = 0; } catch {}
+      el.volume = volume;
+      try { if (el.readyState === 0) el.load(); } catch {}
+      // Keep existing behavior (safe no-op for SFX keys)
+      try { if (typeof applyStartOffset === "function") applyStartOffset(el, key as any); } catch {}
       el.play().catch(() => {});
+    } catch {
+      // ignore
+    }
+  }
+
+  private prewarmSfx(): void {
+    try {
+      const keys = ["coin", "pickup", "portal_in", "portal_out"];
+      for (const k of keys) {
+        const url = (SFX_URLS as any)[k];
+        if (!url) continue;
+        this.ensureSfxPool(k, url);
+      }
     } catch {
       // ignore
     }
