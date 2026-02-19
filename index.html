@@ -92,12 +92,65 @@
       <div id="loading">
         <div class="loading-card">
           <div class="loading-title">Welcome to the Chloeverse!</div>
-          <div class="loading-sub">Click to lock mouse · Press <span class="kbd">Esc</span> to release</div>
+          <div class="loading-sub">Click anywhere to start (this locks your mouse so you can look around)<br>Press <span class="kbd">Esc</span> anytime to unlock your mouse / get your cursor back</div>
+          <div id="loadingTip" class="loading-tip"></div>
           <div id="loadingProgress" class="loading-progress">0%</div>
         </div>
       </div>
     </div>
 
     <script type="module" src="/src/main.ts"></script>
-  </body>
+  
+<script>
+// __sweetlandLoadingTipsV2
+document.addEventListener("DOMContentLoaded", () => {
+  const loading = document.getElementById("loading");
+  const tip = document.getElementById("loadingTip");
+  if (!loading || !tip) return;
+
+  const tips = [
+    "Move: WASD",
+    "Run: hold Shift",
+    "Jump: Space (press twice to double jump)",
+    "Skip exploring (teleport): press 1–4 to jump to the portals",
+    "Talk / interact: E when you see a prompt",
+    "Respawn: press R",
+    "Mute music: M",
+  ];
+
+  let i = 0;
+  let timer = null;
+
+  const isVisible = () => {
+    const s = getComputedStyle(loading);
+    return s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+  };
+
+  const stop = () => {
+    if (timer != null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
+
+  const start = () => {
+    if (timer != null) return;
+    tip.textContent = tips[i++ % tips.length];
+    timer = setInterval(() => {
+      if (!isVisible()) return stop();
+      tip.textContent = tips[i++ % tips.length];
+    }, 500);
+  };
+
+  const sync = () => (isVisible() ? start() : stop());
+  sync();
+
+  new MutationObserver(sync).observe(loading, {
+    attributes: true,
+    attributeFilter: ["style", "class", "hidden"],
+  });
+});
+</script>
+
+</body>
 </html>
