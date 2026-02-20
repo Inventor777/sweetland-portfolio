@@ -117,6 +117,12 @@ export class AudioManager {
   private sfxPools: Record<string, HTMLAudioElement[]> = {};
   private sfxPoolIndex: Record<string, number> = {};
 
+  // SWEETLAND_SFX_WEBAUDIO_V1
+  private sfxCtx: AudioContext | null = null;
+  private masterGain: GainNode | null = null; // used by toggleMute()
+  private sfxBuffers = new Map<string, AudioBuffer>();
+  private sfxLoading = new Map<string, Promise<AudioBuffer | null>>();
+
   constructor() {
     try {
       this.musicMuted = window.localStorage.getItem(MUSIC_STORAGE_KEY) === "1";
@@ -137,7 +143,14 @@ export class AudioManager {
     if (this.started) return;
     this.started = true; this.prewarmSfx();
 
-    if (!this.musicMuted) {
+    
+    // SWEETLAND_SFX_WEBAUDIO_V1: initialize WebAudio + predecode coin/pickup
+    try {
+      this.ensureSfxCtx();
+      void this.loadSfxBuffer("coin");
+      void this.loadSfxBuffer("pickup");
+    } catch {}
+if (!this.musicMuted) {
       // Start with a safe default; zone selection takes over on update().
       this.setTrack(OST_WAV_BY_ZONE.hub, true);
     }
@@ -180,6 +193,11 @@ export class AudioManager {
     try {
       const mul = (key === "coin" || key === "pickup") ? 1.2 : 1.0;
       const volume = clamp01(this.sfxVol * mul);
+
+      // SWEETLAND_SFX_WEBAUDIO_V1: WebAudio first for coin/pickup (unlimited overlap, low latency)
+      if ((key === "coin" || key === "pickup") && this.playSfxWeb(key, volume)) return;
+
+      // Fallback to pooled HTMLAudio (still used for all other SFX)
       this.playFromPool(key, url, volume);
     } catch {
       // ignore
@@ -242,6 +260,97 @@ export class AudioManager {
       }
     } catch {
       // ignore
+    }
+  }
+
+
+  // SWEETLAND_SFX_WEBAUDIO_V1
+  private ensureSfxCtx(): AudioContext | null {
+    if (this.sfxCtx) return this.sfxCtx;
+    const AC: any = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (!AC) return null;
+    try {
+      const ctx: AudioContext = new AC();
+      this.sfxCtx = ctx;
+      if (!this.masterGain) {
+        this.masterGain = ctx.createGain();
+        this.masterGain.gain.value = 1;
+        this.masterGain.connect(ctx.destination);
+      }
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      return ctx;
+    } catch {
+      return null;
+    }
+  }
+
+  private loadSfxBuffer(key: string): Promise<AudioBuffer | null> {
+    const existing = this.sfxBuffers.get(key);
+    if (existing) return Promise.resolve(existing);
+
+    const inflight = this.sfxLoading.get(key);
+    if (inflight) return inflight;
+
+    const url = (SFX_URLS as any)[key];
+    const ctx = this.ensureSfxCtx();
+    if (!url || !ctx) return Promise.resolve(null);
+
+    const p = fetch(url)
+      .then((r) => r.arrayBuffer())
+      .then((ab) => {
+        // Safari sometimes uses callback form; support both
+        return new Promise((resolve, reject) => {
+          const anyCtx: any = ctx as any;
+          const maybe = anyCtx.decodeAudioData(
+            ab,
+            (buf: AudioBuffer) => resolve(buf),
+            (err: any) => reject(err)
+          );
+          if (maybe && typeof maybe.then === "function") {
+            maybe.then(resolve, reject);
+          }
+        });
+      })
+      .then((buf) => {
+        if (buf) this.sfxBuffers.set(key, buf);
+        return buf || null;
+      })
+      .catch(() => null)
+      .finally(() => {
+        this.sfxLoading.delete(key);
+      });
+
+    this.sfxLoading.set(key, p);
+    return p;
+  }
+
+  private playSfxWeb(key: string, volume: number): boolean {
+    // honor global mute if used
+    if ((this as any).__slMuted) return true;
+
+    const ctx = this.ensureSfxCtx();
+    if (!ctx || !this.masterGain) return false;
+
+    const buf = this.sfxBuffers.get(key);
+    if (!buf) {
+      void this.loadSfxBuffer(key);
+      return false;
+    }
+
+    try {
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+
+      const g = ctx.createGain();
+      g.gain.value = volume;
+
+      src.connect(g);
+      g.connect(this.masterGain);
+
+      src.start();
+      return true;
+    } catch {
+      return false;
     }
   }
 
