@@ -13,28 +13,28 @@ export const PORTFOLIO_SECTIONS: PortfolioSection[] = [
   {
     id: "projects",
     title: "Projects",
-    description: "Featured builds, demos, and case studies.",
+    description: "Check out my content here!",
     url: "https://example.com/projects",
     hotkey: "Digit1"
   },
   {
     id: "work",
     title: "Work",
-    description: "Experience, roles, and outcomes.",
+    description: "Career shenanigans!",
     url: "https://example.com/work",
     hotkey: "Digit3"
   },
   {
     id: "collabs",
     title: "Collabs",
-    description: "UGC, partnerships, and creative collaborations.",
+    description: "Here are some of my favorite collaborations!",
     url: "https://example.com/collabs",
     hotkey: "Digit2"
   },
   {
     id: "contact",
     title: "Contact",
-    description: "Let’s talk. Links + socials + email.",
+    description: "Let's talk!",
     url: "https://example.com/contact",
     hotkey: "Digit4"
   }
