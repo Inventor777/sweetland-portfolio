@@ -72,6 +72,7 @@
           <div class="panel-body">
             <div class="panel-actions">
               <a id="panelOpenLink" class="btn" target="_blank" rel="noreferrer">Open in new tab</a>
+              <span class="note" id="panelNote">If the preview is blank, the site may block embeds. Use “Open in new tab”.</span>
             </div>
 
             <div class="panel-iframeWrap">
@@ -91,12 +92,90 @@
       <div id="loading">
         <div class="loading-card">
           <div class="loading-title">Welcome to the Chloeverse!</div>
-          <div class="loading-sub">Click to lock mouse · Press <span class="kbd">Esc</span> to release</div>
+          <div class="loading-sub">Click anywhere to start (this locks your mouse so you can look around)<br>Press <span class="kbd">Esc</span> anytime to unlock your mouse / get your cursor back</div>
+          <div id="loadingTip" class="loading-tip"></div>
           <div id="loadingProgress" class="loading-progress">0%</div>
         </div>
       </div>
     </div>
 
     <script type="module" src="/src/main.ts"></script>
-  </body>
+  
+
+<script>
+// __sweetlandLoadingTipsV3_LIST
+document.addEventListener("DOMContentLoaded", () => {
+  const loading = document.getElementById("loading");
+  const tip = document.getElementById("loadingTip");
+  if (!loading || !tip) return;
+
+  // Make sure the container can display multiple lines nicely even if CSS was single-line
+  tip.style.whiteSpace = "normal";
+
+  const tips = [
+    "Move: WASD",
+    "Run: hold Shift",
+    "Jump: Space (press twice to double jump)",
+    "Skip exploring (teleport): press 1–4 to jump to the portals",
+    "Talk / interact: E when you see a prompt",
+    "Respawn: press R",
+    "Mute music: M",
+  ];
+
+  let idx = 0;
+  let timer = null;
+
+  const isVisible = () => {
+    const s = getComputedStyle(loading);
+    return s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+  };
+
+  const stop = () => {
+    if (timer != null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
+
+  const addLine = () => {
+    if (idx >= tips.length) return;
+
+    const line = document.createElement("div");
+    line.className = "loading-tip-line";
+    line.style.marginTop = "6px";
+    line.textContent = tips[idx++];
+
+    tip.appendChild(line);
+
+    if (idx >= tips.length) stop(); // once all are shown, stop
+  };
+
+  const start = () => {
+    if (timer != null) return;
+
+    // If the list is already built, don't rebuild it.
+    // (This avoids duplicates if the overlay toggles.)
+    if (tip.childElementCount >= tips.length) return;
+
+    // Continue from however many lines already exist
+    idx = Math.min(tip.childElementCount, tips.length);
+
+    // Add immediately, then every 500ms
+    addLine();
+    timer = setInterval(() => {
+      if (!isVisible()) return stop();
+      addLine();
+    }, 500);
+  };
+
+  const sync = () => (isVisible() ? start() : stop());
+  sync();
+
+  new MutationObserver(sync).observe(loading, {
+    attributes: true,
+    attributeFilter: ["style", "class", "hidden"],
+  });
+});
+</script>
+</body>
 </html>
