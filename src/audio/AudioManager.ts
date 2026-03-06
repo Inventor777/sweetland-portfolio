@@ -353,6 +353,12 @@ if (!this.musicMuted) {
 
     this.portalPanelOpen = true;
     this.playSfx("portal_in");
+
+    // Entering a portal panel should fully stop BGM until the panel closes.
+    this.stopMusic();
+    this.fade = null;
+    this.currentZone = null;
+    this.currentTrackFile = null;
   }
 
   /** Portal preview closed (Esc). */
@@ -364,6 +370,8 @@ if (!this.musicMuted) {
 
     // Return to the zone system
     const zone = this.pickZone(this.lastPos, null);
+    this.currentZone = null;
+    this.currentTrackFile = null;
     this.setZone(zone);
   }
 
